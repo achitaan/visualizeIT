@@ -436,6 +436,7 @@ class TrackFrameResult:
     inliers: int = 0
     confidence: float = 0.0
     track_ms: float = 0.0
+    confidence_state: Literal["TRACKING", "AMBIGUOUS", "LOST", "RECOVERING"] | None = None
 
     def __post_init__(self) -> None:
         self.frame_index = _check_int(self.frame_index, "frame_index", min_val=0)
@@ -444,6 +445,12 @@ class TrackFrameResult:
         self.inliers = _check_int(self.inliers, "inliers", min_val=0)
         self.confidence = _check_float(self.confidence, "confidence", min_val=0.0, max_val=1.0)
         self.track_ms = _check_float(self.track_ms, "track_ms", min_val=0.0)
+        if self.confidence_state is None:
+            self.confidence_state = (
+                "TRACKING" if self.state == "tracking" else ("RECOVERING" if self.state == "recovering" else "LOST")
+            )
+        elif self.confidence_state not in ("TRACKING", "AMBIGUOUS", "LOST", "RECOVERING"):
+            raise ContractValidationError(f"Invalid confidence_state: {self.confidence_state!r}")
 
         if self.state != "tracking":
             if (

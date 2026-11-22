@@ -188,7 +188,12 @@ def _compute_vertex_normals(verts: np.ndarray, tris: np.ndarray) -> np.ndarray:
     return vn.astype(np.float32)
 
 
-def build_parametric_mesh(shape: str) -> MeshGeometry:
+def build_parametric_mesh(
+    shape: str,
+    *,
+    cyl_radius: float = 0.06,
+    cyl_height: float = 0.14,
+) -> MeshGeometry:
     """Build a metric parametric 3D mesh for plane, cylinder, box, or curved_panel."""
     s = shape.strip().lower()
     if s == "plane":
@@ -214,7 +219,7 @@ def build_parametric_mesh(shape: str) -> MeshGeometry:
 
     if s == "cylinder":
         n_theta, n_y = 32, 8
-        radius, height = 0.06, 0.14
+        radius, height = float(cyl_radius), float(cyl_height)
         verts, norms, uvs, tris = [], [], [], []
         for j in range(n_y + 1):
             v_frac = j / n_y
@@ -590,6 +595,7 @@ class VideoSurfaceTracker:
         self._sy = 1.0
 
         self._orb = cv2.ORB_create(nfeatures=self.orb_features, nlevels=6, scaleFactor=1.2)
+        self._orb_recovery = cv2.ORB_create(nfeatures=1500, nlevels=8, scaleFactor=1.2, fastThreshold=10)
         self._bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
 
         # Shared state
@@ -605,6 +611,9 @@ class VideoSurfaceTracker:
         self._ref_grad_energy: float = 0.0
         self._ref_kps_native: np.ndarray = np.zeros((0, 2), dtype=np.float32)
         self._ref_descs: np.ndarray | None = None
+        self._ref_keyframes: list[tuple[np.ndarray, np.ndarray]] = []
+        self._use_native_recovery: bool = False
+        self._frames_since_kf: int = 0
 
         # Planar/cylinder/grid state
         self._curr_pts_track: np.ndarray = np.zeros((0, 2), dtype=np.float32)
@@ -757,14 +766,29 @@ class VideoSurfaceTracker:
                 klt_pts = np.vstack([klt_pts, grid[:48]]) if len(klt_pts) else grid[:48]
 
         # Detect reference ORB descriptors inside mask for recovery & re-anchoring
-        kps, descs = self._orb.detectAndCompute(gray_track, seed_mask)
-        if descs is not None and len(kps) > 0:
-            kp_track = np.array([kp.pt for kp in kps], dtype=np.float32)
-            self._ref_kps_native = self._track_to_native(kp_track)
-            self._ref_descs = descs.copy()
+        self._use_native_recovery = (min(bw * self._sx, bh * self._sy) < 95.0) and (self._sx < 0.85)
+        self._ref_keyframes = []
+        self._frames_since_kf = 0
+        if self._use_native_recovery:
+            gray_native = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            kps, descs = self._orb_recovery.detectAndCompute(gray_native, seg.mask)
+            if descs is not None and len(kps) > 0:
+                self._ref_kps_native = np.array([kp.pt for kp in kps], dtype=np.float32)
+                self._ref_descs = descs.copy()
+                self._ref_keyframes.append((self._ref_kps_native.copy(), self._ref_descs.copy()))
+            else:
+                self._ref_kps_native = np.zeros((0, 2), dtype=np.float32)
+                self._ref_descs = None
         else:
-            self._ref_kps_native = np.zeros((0, 2), dtype=np.float32)
-            self._ref_descs = None
+            kps, descs = self._orb_recovery.detectAndCompute(gray_track, seed_mask)
+            if descs is not None and len(kps) > 0:
+                kp_track = np.array([kp.pt for kp in kps], dtype=np.float32)
+                self._ref_kps_native = self._track_to_native(kp_track)
+                self._ref_descs = descs.copy()
+                self._ref_keyframes.append((self._ref_kps_native.copy(), self._ref_descs.copy()))
+            else:
+                self._ref_kps_native = np.zeros((0, 2), dtype=np.float32)
+                self._ref_descs = None
 
         # Precompute 5x5 control grid for mesh_grid / cylinder mode
         gx = np.linspace(float(bx), float(bx + bw), 5, dtype=np.float32)
@@ -794,6 +818,7 @@ class VideoSurfaceTracker:
                 inliers=0,
                 confidence=0.0,
                 track_ms=track_ms,
+                confidence_state="LOST",
             )
 
         self._curr_pts_track = klt_pts.astype(np.float32)
@@ -812,6 +837,7 @@ class VideoSurfaceTracker:
             inliers=int(len(klt_pts)),
             confidence=1.0,
             track_ms=track_ms,
+            confidence_state="TRACKING",
         )
 
     def _lift_2d_to_mesh3d(
@@ -876,6 +902,19 @@ class VideoSurfaceTracker:
         if self.init_pose_control is not None:
             rvec0, tvec0 = self.init_pose_control
             hypotheses = [(np.asarray(rvec0, dtype=np.float64).reshape(3), np.asarray(tvec0, dtype=np.float64).reshape(3), 1.0)]
+        elif self.mesh.source_kind == "parametric" and self.mesh.name == "cylinder":
+            # Causally fit parametric cylinder aspect ratio & upright pose directly from frame-0 mask
+            bx, by, bw, bh = seg.bbox
+            cyl_h = 0.14
+            cyl_r = float(np.clip(0.5 * (float(bw) / max(float(bh), 1.0)) * cyl_h, 0.015, 0.14))
+            self.mesh = build_parametric_mesh("cylinder", cyl_radius=cyl_r, cyl_height=cyl_h)
+            ys_m, xs_m = np.nonzero(seg.mask)
+            mcx = float(xs_m.mean()) if len(xs_m) > 0 else (bx + bw * 0.5)
+            mcy = float(ys_m.mean()) if len(ys_m) > 0 else (by + bh * 0.5)
+            tz0 = max(0.12, fy * cyl_h / max(float(bh), 8.0))
+            tx0 = (mcx - cx) * tz0 / fx
+            ty0 = (mcy - cy) * tz0 / fy
+            hypotheses = [(np.zeros(3, dtype=np.float64), np.array([tx0, ty0, tz0], dtype=np.float64), 0.95)]
         else:
             hypotheses = _estimate_initial_pose_from_mask(seg.mask, self.mesh, self._K)
 
@@ -919,43 +958,98 @@ class VideoSurfaceTracker:
             track_ms=track_ms,
         )
 
-    def _match_orb_to_ref(self, gray_track: np.ndarray, roi: tuple[int, int, int, int] | None = None) -> tuple[np.ndarray, np.ndarray]:
-        """Match current frame ORB descriptors against frame-0 reference bank."""
-        if self._ref_descs is None or len(self._ref_descs) < 8:
+    def _match_orb_to_ref(
+        self,
+        gray_img: np.ndarray,
+        roi: tuple[int, int, int, int] | None = None,
+        *,
+        high_density: bool = False,
+        is_native: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Match current frame ORB descriptors against reference keyframe bank."""
+        if not self._ref_keyframes and (self._ref_descs is None or len(self._ref_descs) < 8):
             return np.zeros((0, 2), dtype=np.float32), np.zeros((0, 2), dtype=np.float32)
 
         ox, oy = 0, 0
         if roi is not None:
             x0, y0, x1, y1 = roi
-            sub = gray_track[y0:y1, x0:x1]
+            sub = gray_img[y0:y1, x0:x1]
             ox, oy = x0, y0
         else:
-            sub = gray_track
+            sub = gray_img
 
-        kps, descs = self._orb.detectAndCompute(sub, None)
+        det = self._orb_recovery if high_density else self._orb
+        kps, descs = det.detectAndCompute(sub, None)
         if descs is None or len(kps) < 6:
             return np.zeros((0, 2), dtype=np.float32), np.zeros((0, 2), dtype=np.float32)
 
-        knn = self._bf.knnMatch(descs, self._ref_descs, k=2)
-        best_by_ref: dict[int, tuple[float, tuple[float, float]]] = {}
-        for pair in knn:
-            if len(pair) < 2:
+        bank = self._ref_keyframes if (high_density and self._ref_keyframes) else (
+            [(self._ref_kps_native, self._ref_descs)] if self._ref_descs is not None else []
+        )
+        best_ref = np.zeros((0, 2), dtype=np.float32)
+        best_cur = np.zeros((0, 2), dtype=np.float32)
+        ratio_thr = 0.80 if high_density else 0.78
+        dist_thr = 64 if high_density else 62
+
+        for kf_pts_native, kf_descs in bank:
+            if kf_descs is None or len(kf_descs) < 8:
                 continue
-            m, n = pair
-            if m.distance < 0.78 * n.distance and m.distance <= 62:
-                prev = best_by_ref.get(m.trainIdx)
-                if prev is None or m.distance < prev[0]:
-                    pt = kps[m.queryIdx].pt
-                    best_by_ref[m.trainIdx] = (m.distance, (pt[0] + ox, pt[1] + oy))
+            knn = self._bf.knnMatch(descs, kf_descs, k=2)
+            best_by_ref: dict[int, tuple[float, tuple[float, float]]] = {}
+            for pair in knn:
+                if len(pair) < 2:
+                    continue
+                m, n = pair
+                if m.distance < ratio_thr * n.distance and m.distance <= dist_thr:
+                    prev = best_by_ref.get(m.trainIdx)
+                    if prev is None or m.distance < prev[0]:
+                        pt = kps[m.queryIdx].pt
+                        best_by_ref[m.trainIdx] = (m.distance, (pt[0] + ox, pt[1] + oy))
+            if len(best_by_ref) > len(best_ref) and len(best_by_ref) >= 6:
+                ref_idxs = sorted(best_by_ref.keys())
+                cur_pts = np.array([best_by_ref[i][1] for i in ref_idxs], dtype=np.float32)
+                cur_native = cur_pts if is_native else self._track_to_native(cur_pts)
+                best_ref = kf_pts_native[ref_idxs]
+                best_cur = cur_native
 
-        if len(best_by_ref) < 6:
-            return np.zeros((0, 2), dtype=np.float32), np.zeros((0, 2), dtype=np.float32)
+        return best_ref, best_cur
 
-        ref_idxs = sorted(best_by_ref.keys())
-        cur_track = np.array([best_by_ref[i][1] for i in ref_idxs], dtype=np.float32)
-        cur_native = self._track_to_native(cur_track)
-        ref_native = self._ref_kps_native[ref_idxs]
-        return ref_native, cur_native
+    def _maybe_store_keyframe(self, frame_bgr: np.ndarray, gray_track: np.ndarray, H: np.ndarray) -> None:
+        """Store up to 5 high-confidence view keyframes mapped to frame-0 coordinates for robust recovery."""
+        if len(self._ref_keyframes) >= 5 or self._ref_mask is None:
+            return
+        try:
+            H_inv = np.linalg.inv(H)
+        except np.linalg.LinAlgError:
+            return
+        warped_quad = cv2.perspectiveTransform(self._ref_quad.reshape(1, 4, 2), H).reshape(4, 2)
+        if self._use_native_recovery:
+            gray_src = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            mask_kf = np.zeros((self._frame_h, self._frame_w), dtype=np.uint8)
+            cv2.fillConvexPoly(mask_kf, np.round(warped_quad).astype(np.int32), 255)
+            kps, descs = self._orb_recovery.detectAndCompute(gray_src, mask_kf)
+            if descs is None or len(kps) < 20:
+                return
+            pts_native = np.array([kp.pt for kp in kps], dtype=np.float32)
+        else:
+            q_track = self._native_to_track(warped_quad)
+            mask_kf = np.zeros((self._track_h, self._track_w), dtype=np.uint8)
+            cv2.fillConvexPoly(mask_kf, np.round(q_track).astype(np.int32), 255)
+            kps, descs = self._orb_recovery.detectAndCompute(gray_track, mask_kf)
+            if descs is None or len(kps) < 20:
+                return
+            pts_native = self._track_to_native(np.array([kp.pt for kp in kps], dtype=np.float32))
+
+        back_ref = cv2.perspectiveTransform(pts_native.reshape(-1, 1, 2), H_inv).reshape(-1, 2)
+        iu = np.clip(np.round(back_ref[:, 0]).astype(np.int32), 0, self._frame_w - 1)
+        iv = np.clip(np.round(back_ref[:, 1]).astype(np.int32), 0, self._frame_h - 1)
+        inside = (
+            (back_ref[:, 0] >= 0) & (back_ref[:, 0] < self._frame_w)
+            & (back_ref[:, 1] >= 0) & (back_ref[:, 1] < self._frame_h)
+            & (self._ref_mask[iv, iu] > 0)
+        )
+        if int(np.count_nonzero(inside)) >= 16:
+            self._ref_keyframes.append((back_ref[inside].astype(np.float32), descs[inside].copy()))
 
     def _run_fb_klt(self, gray_track: np.ndarray, pts_track: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Forward-backward gated pyramidal Lucas-Kanade optical flow."""
@@ -1056,7 +1150,6 @@ class VideoSurfaceTracker:
                     aspect_ratio = min(w_r, h_r) / max(w_r, h_r, 1e-6)
                     if block_ncc < 0.30 and aspect_ratio < 0.48:
                         return False, n_inl, inl_bool, cur_patch, block_ncc
-                # Accept if unoccluded surface blocks match frame-0 OR strong geometric + temporal continuity holds
                 min_anchor = 0.14 if self.grazing_angle_gate else -1.0
                 strong_geom_temporal = (
                     block_ncc >= min_anchor
@@ -1070,7 +1163,8 @@ class VideoSurfaceTracker:
                     return False, n_inl, inl_bool, cur_patch, block_ncc
             else:
                 ncc = _patch_ncc(self._ref_patch, cur_patch)
-                if ncc < min_ncc:
+                block_ncc = _patch_block_ncc_p75(self._ref_patch, cur_patch, grid=4)
+                if max(ncc, block_ncc * 0.85) < min_ncc:
                     return False, n_inl, inl_bool, cur_patch, ncc
 
         return True, n_inl, inl_bool, cur_patch, block_ncc
@@ -1182,7 +1276,24 @@ class VideoSurfaceTracker:
                 # Reprojection RMSE on inliers
                 proj = cv2.perspectiveTransform(ref_all[inl_bool].reshape(-1, 1, 2), H_est).reshape(-1, 2)
                 err = np.linalg.norm(proj - cur_all[inl_bool], axis=1)
-                self._reproj_errors.append(float(np.median(err)) if len(err) else 0.0)
+                med_err = float(np.median(err)) if len(err) else 0.0
+                self._reproj_errors.append(med_err)
+
+                # Explicit AMBIGUOUS gate: suppress overlay when support is thin and appearance is weak
+                if n_inl < 14 and block_ncc < 0.25 and med_err > 2.5:
+                    self._state = "recovering"
+                    self._cand_H = H_est
+                    self._prev_gray = gray_track
+                    track_ms = (time.perf_counter() - t0) * 1000.0
+                    return TrackFrameResult(
+                        frame_index=int(frame_index),
+                        timestamp_s=float(timestamp_s),
+                        state="recovering",
+                        inliers=n_inl,
+                        confidence=0.0,
+                        track_ms=track_ms,
+                        confidence_state="AMBIGUOUS",
+                    )
 
                 self._last_H = H_est
                 self._prev_patch = cur_patch
@@ -1190,12 +1301,17 @@ class VideoSurfaceTracker:
                 self._curr_pts_track = self._native_to_track(cur_all[inl_bool])
                 self._curr_ref_pts_native = ref_all[inl_bool].astype(np.float32)
                 self._frames_since_replenish += 1
-                allow_replenish = (not self.adaptive_appearance_gate) or (block_ncc >= 0.14)
+                self._frames_since_kf += 1
+                # Prevent occluded frames from contaminating KLT memory
+                allow_replenish = (not self.adaptive_appearance_gate) or (block_ncc >= 0.28)
                 if allow_replenish and (
                     len(self._curr_pts_track) < int(self.max_klt_points * 0.55) or self._frames_since_replenish >= 12
                 ):
                     self._replenish_planar_points(gray_track, H_est)
                     self._frames_since_replenish = 0
+                if block_ncc >= 0.35 and n_inl >= 25 and self._frames_since_kf >= 15:
+                    self._maybe_store_keyframe(frame_bgr, gray_track, H_est)
+                    self._frames_since_kf = 0
 
                 self._prev_gray = gray_track
                 self._lost_streak = 0
@@ -1211,6 +1327,7 @@ class VideoSurfaceTracker:
                     inliers=n_inl,
                     confidence=conf,
                     track_ms=track_ms,
+                    confidence_state="TRACKING",
                 )
 
             # Tracking lost -> immediately suppress overlay!
@@ -1230,18 +1347,24 @@ class VideoSurfaceTracker:
                 inliers=n_inl,
                 confidence=0.0,
                 track_ms=track_ms,
+                confidence_state="LOST",
             )
 
-        # --- Lost or Recovering: attempt global ORB re-acquisition ---
-        orb_ref, orb_cur = self._match_orb_to_ref(gray_track, roi=None)
+        # --- Lost or Recovering: high-density multi-keyframe ORB re-acquisition ---
+        if self._use_native_recovery:
+            gray_rec = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            orb_ref, orb_cur = self._match_orb_to_ref(gray_rec, roi=None, high_density=True, is_native=True)
+        else:
+            orb_ref, orb_cur = self._match_orb_to_ref(gray_track, roi=None, high_density=True, is_native=False)
+
         H_cand: np.ndarray | None = None
         inl_mask = None
-        if len(orb_ref) >= 10:
+        if len(orb_ref) >= 9:
             cv2.setRNGSeed(17)
             H_cand, inl_mask = cv2.findHomography(orb_ref, orb_cur, cv2.RANSAC, 4.0)
 
         ok, n_inl, inl_bool, cur_patch, block_ncc = self._validate_homography_and_appearance(
-            H_cand, gray_track, inl_mask, orb_cur, min_inliers=10, min_ncc=0.25, is_recovery=True
+            H_cand, gray_track, inl_mask, orb_cur, min_inliers=9, min_ncc=0.22, is_recovery=True
         )
         self._prev_gray = gray_track
 
@@ -1273,6 +1396,7 @@ class VideoSurfaceTracker:
                         inliers=n_inl,
                         confidence=conf,
                         track_ms=track_ms,
+                        confidence_state="TRACKING",
                     )
             # First valid candidate after loss -> hold in recovering (overlay remains suppressed)
             self._state = "recovering"
@@ -1285,6 +1409,7 @@ class VideoSurfaceTracker:
                 inliers=n_inl,
                 confidence=0.0,
                 track_ms=track_ms,
+                confidence_state="RECOVERING",
             )
 
         self._state = "lost"
@@ -1298,6 +1423,7 @@ class VideoSurfaceTracker:
             inliers=n_inl,
             confidence=0.0,
             track_ms=track_ms,
+            confidence_state="LOST",
         )
 
     def _solve_pnp_robust(

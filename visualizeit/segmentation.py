@@ -29,6 +29,9 @@ class SegmentationResult:
     anchor_count: int
     init_ms: float
     mask_path: str | None = None
+    quality_score: float = 1.0
+    init_valid: bool = True
+    rejection_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -42,6 +45,9 @@ class SegmentationResult:
             "anchor_count": int(self.anchor_count),
             "init_ms": round(float(self.init_ms), 3),
             "mask_path": self.mask_path,
+            "quality_score": round(float(self.quality_score), 4),
+            "init_valid": bool(self.init_valid),
+            "rejection_reason": self.rejection_reason,
         }
 
 
@@ -280,6 +286,38 @@ def segment_frame(
             mx = max(1, rw // 5)
             my = max(1, rh // 5)
             gc_mask[ry + my : ry + rh - my, rx + mx : rx + rw - mx] = cv2.GC_PR_FGD
+        elif sharp_onboarding and pos_pts and rw >= 12 and rh >= 12:
+            # Suppress clearly dissimilar adjacent distractors inside the box (e.g., yellow bottle inside blue pitcher box)
+            small_lab = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+            chroma_std = float(np.std(small_lab[ry : ry + rh, rx : rx + rw, 1:3]))
+            is_color = chroma_std > 4.0
+            seed_feats = []
+            for px, py in pos_pts:
+                sx_i = int(np.clip(round((px - crop_x0) * sx), 0, sw - 1))
+                sy_i = int(np.clip(round((py - crop_y0) * sy), 0, sh - 1))
+                patch = small_lab[max(0, sy_i - 2) : min(sh, sy_i + 3), max(0, sx_i - 2) : min(sw, sx_i + 3)]
+                if patch.size > 0:
+                    seed_feats.append(patch.reshape(-1, 3).mean(axis=0))
+            if seed_feats:
+                roi_lab = small_lab[ry : ry + rh, rx : rx + rw]
+                min_dist = np.full((rh, rw), 1e6, dtype=np.float32)
+                for sf in seed_feats:
+                    if is_color:
+                        # Weight chroma (a, b) higher than L so shading on the same object is tolerated
+                        d = np.sqrt(
+                            0.35 * (roi_lab[:, :, 0] - sf[0]) ** 2
+                            + 1.6 * (roi_lab[:, :, 1] - sf[1]) ** 2
+                            + 1.6 * (roi_lab[:, :, 2] - sf[2]) ** 2
+                        )
+                    else:
+                        d = np.abs(roi_lab[:, :, 0] - sf[0])
+                    min_dist = np.minimum(min_dist, d)
+                thresh = 52.0 if is_color else 58.0
+                dissimilar = min_dist > thresh
+                # Never demote > 75% of the box (preserves multi-colored textured objects like printed boxes/cans)
+                if float(np.mean(dissimilar)) < 0.75:
+                    sub_gc = gc_mask[ry : ry + rh, rx : rx + rw]
+                    sub_gc[dissimilar] = cv2.GC_PR_BGD
     else:
         rx, ry, rw, rh = _estimate_point_roi(
             small_bgr,
@@ -314,11 +352,12 @@ def segment_frame(
     has_fg_cue = bool(np.any((gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD)))
     has_bg_cue = bool(np.any((gc_mask == cv2.GC_BGD) | (gc_mask == cv2.GC_PR_BGD)))
 
+    effective_iters = max(grabcut_iters, 3) if sharp_onboarding else grabcut_iters
     small_mask = np.zeros((sh, sw), dtype=np.uint8)
     if has_fg_cue and has_bg_cue:
         try:
             cv2.setRNGSeed(17)
-            cv2.grabCut(small_bgr, gc_mask, None, bgd_model, fgd_model, grabcut_iters, cv2.GC_INIT_WITH_MASK)
+            cv2.grabCut(small_bgr, gc_mask, None, bgd_model, fgd_model, effective_iters, cv2.GC_INIT_WITH_MASK)
             small_mask = np.where(
                 (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD), 255, 0
             ).astype(np.uint8)
@@ -402,11 +441,14 @@ def segment_frame(
     for nx, ny in neg_pts:
         cv2.circle(mask_u8, (int(round(nx)), int(round(ny))), neg_excl_r, 0, -1)
 
-    # Ensure positive points sit inside mask before connected-component selection
+    # Track how many positive points GrabCut actually segmented BEFORE rescue circles
+    pos_hits_pre = 0
     for px, py in pos_pts:
         ix = int(np.clip(round(px), 0, w - 1))
         iy = int(np.clip(round(py), 0, h - 1))
-        if mask_u8[iy, ix] == 0:
+        if mask_u8[iy, ix] > 0:
+            pos_hits_pre += 1
+        else:
             cv2.circle(mask_u8, (ix, iy), max(4, int(round(min(w, h) * 0.015))), 255, -1)
 
     mask_u8 = _keep_selected_components(mask_u8, pos_pts, neg_pts)
@@ -444,6 +486,39 @@ def segment_frame(
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     anchors = _extract_interior_anchors(gray, mask_u8)
 
+    # Initialization consistency verification
+    init_valid = True
+    rejection_reason: str | None = None
+    quality_score = 1.0
+    if fg_pixels < 16:
+        init_valid = False
+        rejection_reason = "empty_mask"
+        quality_score = 0.0
+    elif coverage > 0.92:
+        init_valid = False
+        rejection_reason = "full_frame_spill"
+        quality_score = 0.05
+    else:
+        fill_ratio = float(fg_pixels) / float(max(bbox_out[2] * bbox_out[3], 1))
+        pos_hit_ratio = (float(pos_hits_pre) / float(len(pos_pts))) if pos_pts else 1.0
+        # Boundary contrast between mask interior and immediate 8px exterior ring
+        dil = cv2.dilate(mask_u8, np.ones((17, 17), np.uint8), iterations=1)
+        ring = (dil > 0) & (mask_u8 == 0)
+        contrast = 15.0
+        if np.any(ring):
+            fg_mean = frame_bgr[mask_u8 > 0].astype(np.float32).mean(axis=0)
+            bg_mean = frame_bgr[ring].astype(np.float32).mean(axis=0)
+            contrast = float(np.linalg.norm(fg_mean - bg_mean))
+        c_score = float(np.clip(contrast / 25.0, 0.0, 1.0))
+        f_score = float(np.clip(fill_ratio / 0.35, 0.0, 1.0))
+        quality_score = float(np.clip(0.45 * pos_hit_ratio + 0.35 * c_score + 0.20 * f_score, 0.0, 1.0))
+        if pos_pts and pos_hits_pre == 0 and fill_ratio < 0.15:
+            init_valid = False
+            rejection_reason = "positive_seed_mismatch"
+        elif contrast < 2.5 and fill_ratio < 0.12:
+            init_valid = False
+            rejection_reason = "low_contrast_fragmented"
+
     saved_path: str | None = None
     if output_mask_path is not None:
         out_p = Path(os.path.abspath(os.fspath(output_mask_path)))
@@ -474,4 +549,7 @@ def segment_frame(
         anchor_count=int(len(anchors)),
         init_ms=init_ms,
         mask_path=saved_path,
+        quality_score=quality_score,
+        init_valid=init_valid,
+        rejection_reason=rejection_reason,
     )

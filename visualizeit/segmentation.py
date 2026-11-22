@@ -286,38 +286,56 @@ def segment_frame(
             mx = max(1, rw // 5)
             my = max(1, rh // 5)
             gc_mask[ry + my : ry + rh - my, rx + mx : rx + rw - mx] = cv2.GC_PR_FGD
-        elif sharp_onboarding and pos_pts and rw >= 12 and rh >= 12:
-            # Suppress clearly dissimilar adjacent distractors inside the box (e.g., yellow bottle inside blue pitcher box)
+        elif sharp_onboarding and pos_pts and neg_pts and rw >= 12 and rh >= 12:
+            # Suppress adjacent distractors inside the box ONLY when explicitly closer to a negative seed
+            # than to any positive seed (preserves multi-colored printed labels like cans/cards/boxes)
             small_lab = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
             chroma_std = float(np.std(small_lab[ry : ry + rh, rx : rx + rw, 1:3]))
             is_color = chroma_std > 4.0
-            seed_feats = []
-            for px, py in pos_pts:
-                sx_i = int(np.clip(round((px - crop_x0) * sx), 0, sw - 1))
-                sy_i = int(np.clip(round((py - crop_y0) * sy), 0, sh - 1))
-                patch = small_lab[max(0, sy_i - 2) : min(sh, sy_i + 3), max(0, sx_i - 2) : min(sw, sx_i + 3)]
-                if patch.size > 0:
-                    seed_feats.append(patch.reshape(-1, 3).mean(axis=0))
-            if seed_feats:
+
+            def _sample_seeds(pts_list: list[tuple[float, float]]) -> list[np.ndarray]:
+                out_s: list[np.ndarray] = []
+                for px, py in pts_list:
+                    sx_i = int(np.clip(round((px - crop_x0) * sx), 0, sw - 1))
+                    sy_i = int(np.clip(round((py - crop_y0) * sy), 0, sh - 1))
+                    patch = small_lab[max(0, sy_i - 2) : min(sh, sy_i + 3), max(0, sx_i - 2) : min(sw, sx_i + 3)]
+                    if patch.size > 0:
+                        out_s.append(patch.reshape(-1, 3).mean(axis=0))
+                return out_s
+
+            pos_feats = _sample_seeds(pos_pts)
+            # Only use negative points that lie inside or near the explicit box as distractor models
+            near_neg = [
+                (nx, ny) for nx, ny in neg_pts
+                if (bx - bw * 0.25 <= nx <= bx + bw * 1.25) and (by - bh * 0.25 <= ny <= by + bh * 1.25)
+            ]
+            neg_feats = _sample_seeds(near_neg)
+            if pos_feats and neg_feats:
                 roi_lab = small_lab[ry : ry + rh, rx : rx + rw]
-                min_dist = np.full((rh, rw), 1e6, dtype=np.float32)
-                for sf in seed_feats:
-                    if is_color:
-                        # Weight chroma (a, b) higher than L so shading on the same object is tolerated
-                        d = np.sqrt(
-                            0.35 * (roi_lab[:, :, 0] - sf[0]) ** 2
-                            + 1.6 * (roi_lab[:, :, 1] - sf[1]) ** 2
-                            + 1.6 * (roi_lab[:, :, 2] - sf[2]) ** 2
-                        )
-                    else:
-                        d = np.abs(roi_lab[:, :, 0] - sf[0])
-                    min_dist = np.minimum(min_dist, d)
-                thresh = 52.0 if is_color else 58.0
-                dissimilar = min_dist > thresh
-                # Never demote > 75% of the box (preserves multi-colored textured objects like printed boxes/cans)
-                if float(np.mean(dissimilar)) < 0.75:
+
+                def _min_lab_dist(feats: list[np.ndarray]) -> np.ndarray:
+                    md = np.full((rh, rw), 1e6, dtype=np.float32)
+                    for sf in feats:
+                        if is_color:
+                            d = np.sqrt(
+                                0.30 * (roi_lab[:, :, 0] - sf[0]) ** 2
+                                + 1.8 * (roi_lab[:, :, 1] - sf[1]) ** 2
+                                + 1.8 * (roi_lab[:, :, 2] - sf[2]) ** 2
+                            )
+                        else:
+                            d = np.abs(roi_lab[:, :, 0] - sf[0])
+                        md = np.minimum(md, d)
+                    return md
+
+                d_pos = _min_lab_dist(pos_feats)
+                d_neg = _min_lab_dist(neg_feats)
+                # Pixel is a likely distractor only if it strongly matches a near negative seed AND mismatches positive seeds
+                thresh_pos = 48.0 if is_color else 42.0
+                thresh_neg = 26.0 if is_color else 22.0
+                distractor = (d_neg < thresh_neg) & (d_pos > thresh_pos) & (d_neg + 16.0 < d_pos)
+                if float(np.mean(distractor)) < 0.65:
                     sub_gc = gc_mask[ry : ry + rh, rx : rx + rw]
-                    sub_gc[dissimilar] = cv2.GC_PR_BGD
+                    sub_gc[distractor] = cv2.GC_PR_BGD
     else:
         rx, ry, rw, rh = _estimate_point_roi(
             small_bgr,
@@ -369,6 +387,41 @@ def segment_frame(
         small_mask = np.where(
             (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD), 255, 0
         ).astype(np.uint8)
+
+    # On monochrome/grayscale images where GrabCut's 1D intensity GMM chops off dark/bright textured
+    # sub-parts of an explicitly boxed object (e.g., black keyboard keys), preserve connected textured
+    # pixels strictly inside the user's explicit box (away from negative seeds).
+    if sharp_onboarding and explicit_box is not None:
+        small_lab_chk = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+        box_area_s = max(rw * rh, 1)
+        fg_fill = float(np.count_nonzero(small_mask[ry : ry + rh, rx : rx + rw])) / float(box_area_s)
+        if float(np.std(small_lab_chk[ry : ry + rh, rx : rx + rw, 1:3])) <= 4.0 and 0.12 <= fg_fill < 0.55:
+            gray_s = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            gx_s = cv2.Sobel(gray_s, cv2.CV_32F, 1, 0, ksize=3)
+            gy_s = cv2.Sobel(gray_s, cv2.CV_32F, 0, 1, ksize=3)
+            gmag_s = np.hypot(gx_s, gy_s)
+            tex_u8 = (gmag_s > 18.0).astype(np.uint8) * 255
+            tex_u8 = cv2.dilate(tex_u8, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+            box_only = np.zeros((sh, sw), dtype=np.uint8)
+            box_only[ry : ry + rh, rx : rx + rw] = 255
+            # Respect explicit negative seeds
+            for nx, ny in neg_pts:
+                cv2.circle(
+                    box_only,
+                    (int(round((nx - crop_x0) * sx)), int(round((ny - crop_y0) * sy))),
+                    max(neg_r + 2, 5),
+                    0,
+                    -1,
+                )
+            cand_u8 = cv2.bitwise_and(cv2.bitwise_or(small_mask, tex_u8), box_only)
+            n_cc, cc_lbl, _, _ = cv2.connectedComponentsWithStats(cand_u8, connectivity=8)
+            if n_cc > 1:
+                fg_lbls = set(int(v) for v in np.unique(cc_lbl[small_mask > 0]) if v > 0)
+                rescued = np.zeros_like(small_mask)
+                for lbl in fg_lbls:
+                    rescued[cc_lbl == lbl] = 255
+                if int(np.count_nonzero(rescued)) > int(np.count_nonzero(small_mask)):
+                    small_mask = rescued
 
     # Fallback if GrabCut collapsed on low-contrast or uniform surface
     if int(np.count_nonzero(small_mask)) < 16:
@@ -452,6 +505,24 @@ def segment_frame(
             cv2.circle(mask_u8, (ix, iy), max(4, int(round(min(w, h) * 0.015))), 255, -1)
 
     mask_u8 = _keep_selected_components(mask_u8, pos_pts, neg_pts)
+
+    # Fill enclosed interior holes (e.g., contrasting printed logos/text on cans/cards) unless marked by a negative point
+    if sharp_onboarding and int(np.count_nonzero(mask_u8)) >= 64:
+        inv = cv2.bitwise_not(mask_u8)
+        n_inv, inv_labels, _, _ = cv2.connectedComponentsWithStats(inv, connectivity=4)
+        if n_inv > 2:
+            # Border-touching labels are exterior background, not interior holes
+            border_lbls = set(np.unique(inv_labels[0, :]).tolist())
+            border_lbls.update(np.unique(inv_labels[-1, :]).tolist())
+            border_lbls.update(np.unique(inv_labels[:, 0]).tolist())
+            border_lbls.update(np.unique(inv_labels[:, -1]).tolist())
+            for nx, ny in neg_pts:
+                ix = int(np.clip(round(nx), 0, w - 1))
+                iy = int(np.clip(round(ny), 0, h - 1))
+                border_lbls.add(int(inv_labels[iy, ix]))
+            for lbl in range(1, n_inv):
+                if lbl not in border_lbls:
+                    mask_u8[inv_labels == lbl] = 255
 
     # Re-enforce negative point exclusion and explicit box after component filtering
     for nx, ny in neg_pts:

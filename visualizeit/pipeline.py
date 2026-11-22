@@ -309,6 +309,7 @@ class VideoPipelineSession:
         spatial_bucketing: bool = True,
         adaptive_appearance_gate: bool = True,
         local_occlusion_mask: bool = True,
+        occlusion_mode: Literal["full", "ref_only", "ref_plus_boundary", "ref_plus_flow"] = "full",
         sharp_onboarding: bool = True,
         grazing_angle_gate: bool = False,
         max_klt_points: int = 180,
@@ -320,6 +321,7 @@ class VideoPipelineSession:
         self.intrinsics = intrinsics
         self.raster_backend = raster_backend
         self.local_occlusion_mask = bool(local_occlusion_mask)
+        self.occlusion_mode = occlusion_mode
         self.sharp_onboarding = bool(sharp_onboarding)
 
         self.tracker = VideoSurfaceTracker(
@@ -352,6 +354,11 @@ class VideoPipelineSession:
         track_res = self.tracker.initialize(frame_bgr, seg)
         track_res.timestamp_s = float(timestamp_s)
 
+        init_pose_0 = (
+            (track_res.pose_rvec, track_res.pose_tvec)
+            if (track_res.pose_rvec is not None and track_res.pose_tvec is not None)
+            else None
+        )
         self.compositor = SurfaceCompositor(
             self.artwork_rgba,
             self.placement,
@@ -360,8 +367,10 @@ class VideoPipelineSession:
             ref_frame_bgr=frame_bgr,
             mesh=self.tracker.mesh,
             intrinsics=self.intrinsics,
+            init_pose=init_pose_0,
             raster_backend=self.raster_backend,
             local_occlusion_mask=self.local_occlusion_mask,
+            occlusion_mode=self.occlusion_mode,
         )
         self._initialized = True
 
@@ -391,6 +400,8 @@ class VideoPipelineSession:
 
         track_res = self.tracker.track_frame(frame_bgr, frame_index, timestamp_s)
         out_bgr, mask, comp_ms = self.compositor.composite(frame_bgr, track_res)
+        if hasattr(self.tracker, "set_occluder_mask"):
+            self.tracker.set_occluder_mask(self.compositor.last_occluder_mask_img)
         return FrameProcessOutput(
             frame_bgr=out_bgr,
             track_result=track_res,

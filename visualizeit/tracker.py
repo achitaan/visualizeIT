@@ -193,8 +193,9 @@ def build_parametric_mesh(
     *,
     cyl_radius: float = 0.06,
     cyl_height: float = 0.14,
+    radius_profile: list[float] | np.ndarray | None = None,
 ) -> MeshGeometry:
-    """Build a metric parametric 3D mesh for plane, cylinder, box, or curved_panel."""
+    """Build a metric parametric 3D mesh for plane, cylinder (or axisymmetric lathe), box, or curved_panel."""
     s = shape.strip().lower()
     if s == "plane":
         nx, ny = 8, 8
@@ -218,19 +219,35 @@ def build_parametric_mesh(
         return MeshGeometry("plane", np.asarray(verts, np.float32), np.asarray(norms, np.float32), np.asarray(uvs, np.float32), np.asarray(tris, np.int32), "parametric")
 
     if s == "cylinder":
-        n_theta, n_y = 32, 8
+        n_theta = 32
+        if radius_profile is not None and len(radius_profile) >= 3:
+            prof = np.asarray(radius_profile, dtype=np.float64).ravel()
+            n_y = len(prof) - 1
+        else:
+            n_y = 8
+            prof = np.ones(n_y + 1, dtype=np.float64)
         radius, height = float(cyl_radius), float(cyl_height)
         verts, norms, uvs, tris = [], [], [], []
+        dy = height / max(n_y, 1)
         for j in range(n_y + 1):
             v_frac = j / n_y
             y = (v_frac - 0.5) * height
+            r_j = radius * float(prof[j])
+            # Slope dr/dy for accurate axisymmetric surface normal
+            r_prev = radius * float(prof[max(0, j - 1)])
+            r_next = radius * float(prof[min(n_y, j + 1)])
+            dr_dy = (r_next - r_prev) / (max(1, min(n_y, j + 1) - max(0, j - 1)) * dy)
+            ny_v = -dr_dy
+            n_len = math.hypot(1.0, ny_v)
+            radial_s = 1.0 / n_len
+            ny_norm = ny_v / n_len
             for i in range(n_theta + 1):
                 u_frac = i / n_theta
                 theta = (u_frac - 0.5) * 2.0 * math.pi
                 nx_v = math.sin(theta)
                 nz_v = -math.cos(theta)
-                verts.append([radius * nx_v, y, radius * nz_v])
-                norms.append([nx_v, 0.0, nz_v])
+                verts.append([r_j * nx_v, y, r_j * nz_v])
+                norms.append([nx_v * radial_s, ny_norm, nz_v * radial_s])
                 uvs.append([u_frac, v_frac])
         for j in range(n_y):
             for i in range(n_theta):
@@ -595,7 +612,9 @@ class VideoSurfaceTracker:
         self._sy = 1.0
 
         self._orb = cv2.ORB_create(nfeatures=self.orb_features, nlevels=6, scaleFactor=1.2)
-        self._orb_recovery = cv2.ORB_create(nfeatures=1500, nlevels=8, scaleFactor=1.2, fastThreshold=10)
+        self._orb_recovery = cv2.ORB_create(
+            nfeatures=2000, nlevels=8, scaleFactor=1.2, edgeThreshold=15, patchSize=15, fastThreshold=8
+        )
         self._bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
 
         # Shared state
@@ -628,12 +647,19 @@ class VideoSurfaceTracker:
         self._K: np.ndarray | None = None
         self._mesh_pts3d_bank: np.ndarray = np.zeros((0, 3), dtype=np.float64)
         self._mesh_descs_bank: np.ndarray | None = None
+        self._mesh_keyframes: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        self._init_tz: float = 0.5
+        self._last_occluder_mask_img: np.ndarray | None = None
         self._curr_pts3d: np.ndarray = np.zeros((0, 3), dtype=np.float64)
         self._last_rvec: np.ndarray | None = None
         self._last_tvec: np.ndarray | None = None
         self._cand_pose: tuple[np.ndarray, np.ndarray] | None = None
         self._alt_hypotheses: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
         self._reproj_errors: list[float] = []
+
+    def set_occluder_mask(self, mask_img: np.ndarray | None) -> None:
+        """Receive detected foreground/hand occluder mask (native resolution uint8) to exclude from tracking memory."""
+        self._last_occluder_mask_img = mask_img
 
     @property
     def ref_bbox(self) -> tuple[int, int, int, int]:
@@ -674,35 +700,48 @@ class VideoSurfaceTracker:
         return out
 
     def _detect_corners_in_mask(self, gray_track: np.ndarray, mask_track: np.ndarray) -> np.ndarray:
-        """Detect corners in tracking-space mask with optional 8x6 spatial bucketing."""
+        """Detect corners in tracking-space mask (ROI-cropped for speed on high-res frames) with optional 8x6 bucketing."""
+        ys, xs = np.nonzero(mask_track)
+        if len(xs) == 0:
+            return np.zeros((0, 2), dtype=np.float32)
+        h, w = gray_track.shape[:2]
+        x0 = max(0, int(xs.min()) - 6)
+        y0 = max(0, int(ys.min()) - 6)
+        x1 = min(w, int(xs.max()) + 7)
+        y1 = min(h, int(ys.max()) + 7)
+        sub_gray = gray_track[y0:y1, x0:x1]
+        sub_mask = mask_track[y0:y1, x0:x1]
+
         if not self.spatial_bucketing:
             corners = cv2.goodFeaturesToTrack(
-                gray_track,
+                sub_gray,
                 maxCorners=self.max_klt_points,
                 qualityLevel=0.01,
                 minDistance=4.0,
-                mask=mask_track,
+                mask=sub_mask,
                 blockSize=5,
             )
             if corners is None or len(corners) == 0:
                 return np.zeros((0, 2), dtype=np.float32)
-            return corners.reshape(-1, 2).astype(np.float32)
+            pts = corners.reshape(-1, 2).astype(np.float32)
+            pts[:, 0] += float(x0)
+            pts[:, 1] += float(y0)
+            return pts
 
         # Fixed-budget 8x6 spatial bucketing: detect up to 3x candidates, reserve per cell, cap at exact max_klt_points
         corners = cv2.goodFeaturesToTrack(
-            gray_track,
+            sub_gray,
             maxCorners=self.max_klt_points * 3,
             qualityLevel=0.005,
             minDistance=3.0,
-            mask=mask_track,
+            mask=sub_mask,
             blockSize=5,
         )
         if corners is None or len(corners) == 0:
             return np.zeros((0, 2), dtype=np.float32)
         pts = corners.reshape(-1, 2).astype(np.float32)
-        ys, xs = np.nonzero(mask_track)
-        if len(xs) == 0:
-            return pts[: self.max_klt_points]
+        pts[:, 0] += float(x0)
+        pts[:, 1] += float(y0)
         bbox = (float(xs.min()), float(ys.min()), float(xs.max() - xs.min() + 1), float(ys.max() - ys.min() + 1))
         # goodFeaturesToTrack returns points sorted by descending corner quality
         scores = np.linspace(1.0, 0.1, len(pts), dtype=np.float32)
@@ -719,9 +758,15 @@ class VideoSurfaceTracker:
         cv2.setRNGSeed(17)
 
         self._frame_h, self._frame_w = frame_bgr.shape[:2]
-        if self._frame_h > self.tracking_height:
-            scale = float(self.tracking_height) / float(self._frame_h)
-            self._track_h = self.tracking_height
+        bx, by, bw, bh = seg.bbox
+        min_obj_dim = float(max(1, min(bw, bh)))
+        scale_base = min(1.0, float(self.tracking_height) / float(self._frame_h))
+        # Adaptive object-scale tracking: ensure small objects (e.g., portrait SHOW3D mug/keyboard)
+        # retain >= 96 px on their shorter side at tracking resolution (capped at native resolution).
+        scale_obj = min(1.0, 96.0 / min_obj_dim)
+        scale = max(scale_base, scale_obj)
+        if scale < 0.98:
+            self._track_h = max(32, int(round(self._frame_h * scale)))
             self._track_w = max(32, int(round(self._frame_w * scale)))
         else:
             self._track_h = self._frame_h
@@ -733,7 +778,7 @@ class VideoSurfaceTracker:
         self._prev_gray = gray_track
         self._ref_mask = seg.mask.copy()
         self._ref_bbox = seg.bbox
-        bx, by, bw, bh = seg.bbox
+        self._last_2d_bbox: tuple[int, int, int, int] = tuple(int(v) for v in seg.bbox)
         self._ref_quad = np.array(
             [[bx, by], [bx + bw, by], [bx + bw, by + bh], [bx, by + bh]],
             dtype=np.float32,
@@ -766,7 +811,7 @@ class VideoSurfaceTracker:
                 klt_pts = np.vstack([klt_pts, grid[:48]]) if len(klt_pts) else grid[:48]
 
         # Detect reference ORB descriptors inside mask for recovery & re-anchoring
-        self._use_native_recovery = (min(bw * self._sx, bh * self._sy) < 95.0) and (self._sx < 0.85)
+        self._use_native_recovery = (min(bw, bh) < 180.0) and (self._sx < 0.99)
         self._ref_keyframes = []
         self._frames_since_kf = 0
         if self._use_native_recovery:
@@ -780,7 +825,7 @@ class VideoSurfaceTracker:
                 self._ref_kps_native = np.zeros((0, 2), dtype=np.float32)
                 self._ref_descs = None
         else:
-            kps, descs = self._orb_recovery.detectAndCompute(gray_track, seed_mask)
+            kps, descs = self._orb_recovery.detectAndCompute(gray_track, mask_track)
             if descs is not None and len(kps) > 0:
                 kp_track = np.array([kp.pt for kp in kps], dtype=np.float32)
                 self._ref_kps_native = self._track_to_native(kp_track)
@@ -903,15 +948,52 @@ class VideoSurfaceTracker:
             rvec0, tvec0 = self.init_pose_control
             hypotheses = [(np.asarray(rvec0, dtype=np.float64).reshape(3), np.asarray(tvec0, dtype=np.float64).reshape(3), 1.0)]
         elif self.mesh.source_kind == "parametric" and self.mesh.name == "cylinder":
-            # Causally fit parametric cylinder aspect ratio & upright pose directly from frame-0 mask
+            # Exact perspective-correct causal cylinder/lathe fit from frame-0 mask (accounts for front-surface Z = tz - r)
             bx, by, bw, bh = seg.bbox
-            cyl_h = 0.14
-            cyl_r = float(np.clip(0.5 * (float(bw) / max(float(bh), 1.0)) * cyl_h, 0.015, 0.14))
-            self.mesh = build_parametric_mesh("cylinder", cyl_radius=cyl_r, cyl_height=cyl_h)
             ys_m, xs_m = np.nonzero(seg.mask)
-            mcx = float(xs_m.mean()) if len(xs_m) > 0 else (bx + bw * 0.5)
-            mcy = float(ys_m.mean()) if len(ys_m) > 0 else (by + bh * 0.5)
-            tz0 = max(0.12, fy * cyl_h / max(float(bh), 8.0))
+            rad_prof: np.ndarray | None = None
+            if len(xs_m) >= 32:
+                # Use tight 0.5%-99.5% quantiles so stray pixels don't inflate size without shrinking true extent
+                x_lo, x_hi = float(np.percentile(xs_m, 0.5)), float(np.percentile(xs_m, 99.5))
+                y_lo, y_hi = float(np.percentile(ys_m, 0.5)), float(np.percentile(ys_m, 99.5))
+                eff_w = max(8.0, x_hi - x_lo)
+                eff_h = max(8.0, y_hi - y_lo)
+                mcx = 0.5 * (x_lo + x_hi)
+                mcy = 0.5 * (y_lo + y_hi)
+
+                # Extract 17-slice axisymmetric radius profile r(v) so tapered bottles (e.g., BBQ sauce)
+                # fit their true 3D silhouette across ALL 360 deg without overhanging narrow necks!
+                n_slices = 17
+                row_widths = np.full(n_slices, eff_w, dtype=np.float64)
+                slice_h = eff_h / float(n_slices)
+                for sj in range(n_slices):
+                    sy0 = int(round(y_lo + sj * slice_h))
+                    sy1 = max(sy0 + 1, int(round(y_lo + (sj + 1) * slice_h)))
+                    band = seg.mask[max(0, sy0):min(self._frame_h, sy1), :]
+                    bxs = np.nonzero(band)[1]
+                    if len(bxs) >= 4:
+                        row_widths[sj] = float(np.percentile(bxs, 97) - np.percentile(bxs, 3))
+                # Smooth 3-tap along height
+                prof_raw = np.clip(row_widths / max(eff_w, 1.0), 0.30, 1.05)
+                prof_s = prof_raw.copy()
+                prof_s[1:-1] = 0.25 * prof_raw[:-2] + 0.50 * prof_raw[1:-1] + 0.25 * prof_raw[2:]
+                # Only enable tapered lathe when genuine neck tapering exists (narrower than 0.72x at 10th percentile)
+                if float(np.percentile(prof_s, 10)) < 0.72:
+                    rad_prof = prof_s
+            else:
+                eff_w, eff_h = max(8.0, float(bw)), max(8.0, float(bh))
+                mcx, mcy = bx + bw * 0.5, by + bh * 0.5
+            cyl_h = 0.14
+            # Solve coupled perspective equations:
+            #   eff_h = fy * cyl_h / (tz0 - cyl_r)
+            #   eff_w/2 = fx * cyl_r / sqrt(tz0^2 - cyl_r^2)
+            cyl_r = float(np.clip(0.5 * (eff_w / eff_h) * cyl_h, 0.015, 0.14))
+            tz0 = max(0.14, fy * cyl_h / eff_h + cyl_r)
+            for _ in range(3):
+                half_w_rad = (0.5 * eff_w) / max(fx, 1.0)
+                cyl_r = float(np.clip(tz0 * half_w_rad / math.sqrt(1.0 + half_w_rad * half_w_rad), 0.015, 0.14))
+                tz0 = max(0.14, fy * cyl_h / eff_h + cyl_r)
+            self.mesh = build_parametric_mesh("cylinder", cyl_radius=cyl_r, cyl_height=cyl_h, radius_profile=rad_prof)
             tx0 = (mcx - cx) * tz0 / fx
             ty0 = (mcy - cy) * tz0 / fy
             hypotheses = [(np.zeros(3, dtype=np.float64), np.array([tx0, ty0, tz0], dtype=np.float64), 0.95)]
@@ -920,6 +1002,33 @@ class VideoSurfaceTracker:
 
         # Primary hypothesis
         best_rvec, best_tvec, _ = hypotheses[0]
+        self._init_tz = float(best_tvec[2])
+        self._last_sil_bbox: tuple[int, int, int, int] = tuple(int(v) for v in seg.bbox)
+        self._last_occluder_mask_img = None
+        # Build frame-0 target Lab LUT (color frames only) to prevent background pixels from contaminating 3D replenishment
+        # and to catch off-object drift into empty background space.
+        self._ref_6dof_lab_lut: np.ndarray | None = None
+        b0, g0, r0 = frame_bgr[::4, ::4, 0], frame_bgr[::4, ::4, 1], frame_bgr[::4, ::4, 2]
+        chroma0 = float(np.mean(np.abs(r0.astype(np.int16) - g0.astype(np.int16)) + np.abs(g0.astype(np.int16) - b0.astype(np.int16))))
+        if chroma0 > 6.0 and int(np.count_nonzero(seg.mask)) >= 100:
+            lab0 = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2LAB)
+            t_pts = lab0[seg.mask > 0]
+            lut_cnt = np.zeros((14, 33, 33), dtype=np.int32)
+            np.add.at(
+                lut_cnt,
+                (
+                    np.clip(t_pts[:, 0] // 20, 0, 13),
+                    np.clip(t_pts[:, 1] // 8, 0, 32),
+                    np.clip(t_pts[:, 2] // 8, 0, 32),
+                ),
+                1,
+            )
+            lut_b = lut_cnt >= max(10, int(0.015 * len(t_pts)))
+            # L-only +/-1 dilation tolerates shading shifts without whitelisting unrelated background colors
+            lut_d = lut_b.copy()
+            lut_d[1:, :, :] |= lut_b[:-1, :, :]
+            lut_d[:-1, :, :] |= lut_b[1:, :, :]
+            self._ref_6dof_lab_lut = lut_d
         pts_native = self._track_to_native(klt_pts_track)
         pts3d, valid = self._lift_2d_to_mesh3d(pts_native, best_rvec, best_tvec)
         self._curr_pts_track = klt_pts_track[valid].astype(np.float32)
@@ -932,11 +1041,19 @@ class VideoSurfaceTracker:
             if len(alt_pts3d) >= 12:
                 self._alt_hypotheses.append((alt_rvec.copy(), alt_tvec.copy(), klt_pts_track[alt_valid].astype(np.float32), alt_pts3d))
 
-        # Lift ORB reference bank to 3D for occlusion re-acquisition
+        # Lift ORB reference bank to 3D for occlusion re-acquisition & seed verified multi-keyframe bank
+        self._mesh_keyframes = []
         if self._ref_descs is not None and len(self._ref_kps_native) > 0:
             orb_pts3d, orb_valid = self._lift_2d_to_mesh3d(self._ref_kps_native, best_rvec, best_tvec)
             self._mesh_pts3d_bank = orb_pts3d[:1500]
             self._mesh_descs_bank = self._ref_descs[orb_valid][:1500].copy()
+            if len(self._mesh_pts3d_bank) >= 12:
+                self._mesh_keyframes.append((
+                    best_rvec.copy(),
+                    best_tvec.copy(),
+                    self._mesh_pts3d_bank.copy(),
+                    self._mesh_descs_bank.copy(),
+                ))
         else:
             self._mesh_pts3d_bank = np.zeros((0, 3), dtype=np.float64)
             self._mesh_descs_bank = None
@@ -956,6 +1073,7 @@ class VideoSurfaceTracker:
             inliers=int(len(self._curr_pts3d)),
             confidence=1.0,
             track_ms=track_ms,
+            confidence_state="TRACKING",
         )
 
     def _match_orb_to_ref(
@@ -989,7 +1107,7 @@ class VideoSurfaceTracker:
         best_ref = np.zeros((0, 2), dtype=np.float32)
         best_cur = np.zeros((0, 2), dtype=np.float32)
         ratio_thr = 0.80 if high_density else 0.78
-        dist_thr = 64 if high_density else 62
+        dist_thr = 72 if high_density else 62
 
         for kf_pts_native, kf_descs in bank:
             if kf_descs is None or len(kf_descs) < 8:
@@ -1056,13 +1174,16 @@ class VideoSurfaceTracker:
         if self._prev_gray is None or len(pts_track) == 0:
             return np.zeros((0, 2), dtype=np.float32), np.zeros(0, dtype=bool)
         p0 = pts_track.reshape(-1, 1, 2).astype(np.float32)
+        win_sz = (21, 21) if self._track_h > 600 else (15, 15)
+        max_lvl = 4 if self._track_h > 600 else 3
+        fb_max = 2.0 if self._track_h > 600 else 1.5
         p1, st1, _ = cv2.calcOpticalFlowPyrLK(
             self._prev_gray,
             gray_track,
             p0,
             None,
-            winSize=(15, 15),
-            maxLevel=3,
+            winSize=win_sz,
+            maxLevel=max_lvl,
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 0.03),
         )
         if p1 is None or st1 is None:
@@ -1072,8 +1193,8 @@ class VideoSurfaceTracker:
             self._prev_gray,
             p1,
             None,
-            winSize=(15, 15),
-            maxLevel=3,
+            winSize=win_sz,
+            maxLevel=max_lvl,
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 0.03),
         )
         if pb is None or st2 is None:
@@ -1083,7 +1204,7 @@ class VideoSurfaceTracker:
         good = (
             (st1.ravel() == 1)
             & (st2.ravel() == 1)
-            & (fb_err <= 1.5)
+            & (fb_err <= fb_max)
             & np.all(np.isfinite(p1_2d), axis=1)
             & (p1_2d[:, 0] >= 0.0)
             & (p1_2d[:, 0] < float(self._track_w))
@@ -1153,11 +1274,11 @@ class VideoSurfaceTracker:
                 min_anchor = 0.14 if self.grazing_angle_gate else -1.0
                 strong_geom_temporal = (
                     block_ncc >= min_anchor
-                    and n_inl >= 28
+                    and n_inl >= 18
                     and inlier_ratio >= 0.55
-                    and span_x >= 0.30 * q_w
-                    and span_y >= 0.30 * q_h
-                    and temp_ncc >= 0.40
+                    and span_x >= 0.25 * q_w
+                    and span_y >= 0.25 * q_h
+                    and temp_ncc >= 0.42
                 )
                 if block_ncc < 0.20 and not strong_geom_temporal:
                     return False, n_inl, inl_bool, cur_patch, block_ncc
@@ -1170,7 +1291,7 @@ class VideoSurfaceTracker:
         return True, n_inl, inl_bool, cur_patch, block_ncc
 
     def _replenish_planar_points(self, gray_track: np.ndarray, H: np.ndarray) -> None:
-        """Detect new Shi-Tomasi corners inside the current tracked object and map back to frame-0 coords."""
+        """Detect new Shi-Tomasi corners inside the current tracked object (excluding planar occluders) and map back to frame-0 coords."""
         if self._ref_mask is None:
             return
         try:
@@ -1181,6 +1302,20 @@ class VideoSurfaceTracker:
         q_track = self._native_to_track(warped_quad)
         mask_cur = np.zeros((self._track_h, self._track_w), dtype=np.uint8)
         cv2.fillConvexPoly(mask_cur, np.round(q_track).astype(np.int32), 255)
+        if (
+            self.wrap_mode == "planar"
+            and self._last_occluder_mask_img is not None
+            and self._last_occluder_mask_img.shape == (self._frame_h, self._frame_w)
+        ):
+            occ_tr = (
+                cv2.resize(self._last_occluder_mask_img, (self._track_w, self._track_h), interpolation=cv2.INTER_NEAREST)
+                if (self._track_w != self._frame_w or self._track_h != self._frame_h)
+                else self._last_occluder_mask_img
+            )
+            occ_tr = cv2.dilate(occ_tr, np.ones((7, 7), np.uint8), iterations=1)
+            cand = cv2.bitwise_and(mask_cur, cv2.bitwise_not(occ_tr))
+            if int(np.count_nonzero(cand)) >= int(0.45 * max(int(np.count_nonzero(mask_cur)), 1)):
+                mask_cur = cand
         mask_cur = cv2.erode(mask_cur, np.ones((3, 3), np.uint8), iterations=1)
         new_pts_track = self._detect_corners_in_mask(gray_track, mask_cur)
         if len(new_pts_track) == 0:
@@ -1235,7 +1370,7 @@ class VideoSurfaceTracker:
         gray_track = self._to_track_gray(frame_bgr)
 
         if self.wrap_mode == "mesh_6dof":
-            return self._track_frame_6dof(gray_track, frame_index, timestamp_s, t0)
+            return self._track_frame_6dof(frame_bgr, gray_track, frame_index, timestamp_s, t0)
 
         # --- Planar / Cylinder / Mesh-Grid Tracking ---
         if self._state == "tracking":
@@ -1243,6 +1378,24 @@ class VideoSurfaceTracker:
             klt_cur_track = p1_track[good]
             klt_ref_native = self._curr_ref_pts_native[good]
             klt_cur_native = self._track_to_native(klt_cur_track)
+
+            # Filter out KLT points sitting inside (dilated) detected planar foreground occluder mask BEFORE RANSAC
+            planar_occ_frac = 0.0
+            if (
+                self.wrap_mode == "planar"
+                and self._last_occluder_mask_img is not None
+                and len(klt_cur_native) >= 16
+                and self._last_occluder_mask_img.shape == (self._frame_h, self._frame_w)
+            ):
+                occ_dil = cv2.dilate(self._last_occluder_mask_img, np.ones((15, 15), np.uint8), iterations=1)
+                iu = np.clip(np.round(klt_cur_native[:, 0]).astype(np.int32), 0, self._frame_w - 1)
+                iv = np.clip(np.round(klt_cur_native[:, 1]).astype(np.int32), 0, self._frame_h - 1)
+                unocc = occ_dil[iv, iu] == 0
+                planar_occ_frac = 1.0 - (float(np.count_nonzero(unocc)) / float(len(unocc)))
+                if planar_occ_frac < 0.52 and int(np.count_nonzero(unocc)) >= 14:
+                    klt_cur_track = klt_cur_track[unocc]
+                    klt_ref_native = klt_ref_native[unocc]
+                    klt_cur_native = klt_cur_native[unocc]
 
             ref_all = klt_ref_native
             cur_all = klt_cur_native
@@ -1258,7 +1411,7 @@ class VideoSurfaceTracker:
             inl_mask: np.ndarray | None = None
             if len(ref_all) >= 8:
                 cv2.setRNGSeed(17)
-                H_est, inl_mask = cv2.findHomography(ref_all, cur_all, cv2.RANSAC, 3.5)
+                H_est, inl_mask = cv2.findHomography(ref_all, cur_all, cv2.RANSAC, 3.0)
 
             ok, n_inl, inl_bool, cur_patch, block_ncc = self._validate_homography_and_appearance(
                 H_est, gray_track, inl_mask, cur_all, min_inliers=10, min_ncc=0.18, is_recovery=False
@@ -1296,6 +1449,13 @@ class VideoSurfaceTracker:
                     )
 
                 self._last_H = H_est
+                warped_q_2d = cv2.perspectiveTransform(self._ref_quad.reshape(1, 4, 2), H_est).reshape(4, 2)
+                x0_2 = max(0, int(math.floor(float(warped_q_2d[:, 0].min()))))
+                y0_2 = max(0, int(math.floor(float(warped_q_2d[:, 1].min()))))
+                x1_2 = min(self._frame_w, int(math.ceil(float(warped_q_2d[:, 0].max()))))
+                y1_2 = min(self._frame_h, int(math.ceil(float(warped_q_2d[:, 1].max()))))
+                if (x1_2 - x0_2) >= 12 and (y1_2 - y0_2) >= 12:
+                    self._last_2d_bbox = (x0_2, y0_2, x1_2 - x0_2, y1_2 - y0_2)
                 self._prev_patch = cur_patch
                 self._last_block_ncc = block_ncc
                 self._curr_pts_track = self._native_to_track(cur_all[inl_bool])
@@ -1303,7 +1463,7 @@ class VideoSurfaceTracker:
                 self._frames_since_replenish += 1
                 self._frames_since_kf += 1
                 # Prevent occluded frames from contaminating KLT memory
-                allow_replenish = (not self.adaptive_appearance_gate) or (block_ncc >= 0.28)
+                allow_replenish = ((not self.adaptive_appearance_gate) or (block_ncc >= 0.28)) and (planar_occ_frac < 0.08)
                 if allow_replenish and (
                     len(self._curr_pts_track) < int(self.max_klt_points * 0.55) or self._frames_since_replenish >= 12
                 ):
@@ -1350,12 +1510,40 @@ class VideoSurfaceTracker:
                 confidence_state="LOST",
             )
 
-        # --- Lost or Recovering: high-density multi-keyframe ORB re-acquisition ---
+        # --- Lost or Recovering: high-density multi-keyframe ORB re-acquisition (causal local ROI + full-frame) ---
         if self._use_native_recovery:
             gray_rec = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-            orb_ref, orb_cur = self._match_orb_to_ref(gray_rec, roi=None, high_density=True, is_native=True)
+            rec_h, rec_w = self._frame_h, self._frame_w
+            is_nat = True
         else:
-            orb_ref, orb_cur = self._match_orb_to_ref(gray_track, roi=None, high_density=True, is_native=False)
+            gray_rec = gray_track
+            rec_h, rec_w = self._track_h, self._track_w
+            is_nat = False
+
+        orb_ref = np.zeros((0, 2), dtype=np.float32)
+        orb_cur = np.zeros((0, 2), dtype=np.float32)
+        # First try causal generous 3.5x ROI around last verified 2D bbox (concentrates ORB keypoints on small objects)
+        lbx, lby, lbw, lbh = self._last_2d_bbox
+        if not is_nat:
+            lbx = int(round(lbx * self._sx))
+            lby = int(round(lby * self._sy))
+            lbw = max(12, int(round(lbw * self._sx)))
+            lbh = max(12, int(round(lbh * self._sy)))
+        pad_x = max(lbw, int(0.20 * rec_w))
+        pad_y = max(lbh, int(0.20 * rec_h))
+        rx0 = max(0, lbx - pad_x)
+        ry0 = max(0, lby - pad_y)
+        rx1 = min(rec_w, lbx + lbw + pad_x)
+        ry1 = min(rec_h, lby + lbh + pad_y)
+        if (rx1 - rx0) >= 48 and (ry1 - ry0) >= 48 and (rx1 - rx0) * (ry1 - ry0) < int(0.75 * rec_w * rec_h):
+            r_ref, r_cur = self._match_orb_to_ref(gray_rec, roi=(rx0, ry0, rx1, ry1), high_density=True, is_native=is_nat)
+            if len(r_ref) > len(orb_ref):
+                orb_ref, orb_cur = r_ref, r_cur
+        # Fallback to full-frame search if ROI yielded thin matches (handles large motion during blackout)
+        if len(orb_ref) < 20:
+            f_ref, f_cur = self._match_orb_to_ref(gray_rec, roi=None, high_density=True, is_native=is_nat)
+            if len(f_ref) > len(orb_ref):
+                orb_ref, orb_cur = f_ref, f_cur
 
         H_cand: np.ndarray | None = None
         inl_mask = None
@@ -1363,8 +1551,10 @@ class VideoSurfaceTracker:
             cv2.setRNGSeed(17)
             H_cand, inl_mask = cv2.findHomography(orb_ref, orb_cur, cv2.RANSAC, 4.0)
 
+        n_inl_raw = int(np.count_nonzero(inl_mask)) if inl_mask is not None else 0
+        rec_min_ncc = 0.14 if n_inl_raw >= 20 else 0.22
         ok, n_inl, inl_bool, cur_patch, block_ncc = self._validate_homography_and_appearance(
-            H_cand, gray_track, inl_mask, orb_cur, min_inliers=9, min_ncc=0.22, is_recovery=True
+            H_cand, gray_track, inl_mask, orb_cur, min_inliers=9, min_ncc=rec_min_ncc, is_recovery=True
         )
         self._prev_gray = gray_track
 
@@ -1465,7 +1655,13 @@ class VideoSurfaceTracker:
             except cv2.error:
                 pass
 
-        best_res: tuple[int, float, np.ndarray, np.ndarray, np.ndarray] | None = None
+        best_res: tuple[bool, int, float, np.ndarray, np.ndarray, np.ndarray] | None = None
+        R_prior = None
+        tz_prior = None
+        if prior is not None:
+            R_prior, _ = cv2.Rodrigues(prior[0].astype(np.float64).reshape(3))
+            tz_prior = float(prior[1].reshape(3)[2])
+
         for rvec, tvec in proposals:
             if not (np.all(np.isfinite(rvec)) and np.all(np.isfinite(tvec))) or tvec[2] <= 0.04:
                 continue
@@ -1493,18 +1689,35 @@ class VideoSurfaceTracker:
             if n_inl < 8:
                 continue
             rmse = float(math.sqrt(float(np.mean(errs[inl_bool] ** 2))))
-            if best_res is None or (n_inl > best_res[0]) or (n_inl == best_res[0] and rmse < best_res[1]):
-                best_res = (n_inl, rmse, rvec, tvec, inl_bool)
+            kin_ok = True
+            if R_prior is not None and tz_prior is not None and tz_prior > 0.04:
+                R_c, _ = cv2.Rodrigues(rvec)
+                d_ang = math.degrees(math.acos(float(np.clip((np.trace(R_c @ R_prior.T) - 1.0) * 0.5, -1.0, 1.0))))
+                z_ratio = float(tvec[2]) / tz_prior
+                kin_ok = (d_ang <= 32.0) and (0.62 <= z_ratio <= 1.60)
+            if best_res is None:
+                best_res = (kin_ok, n_inl, rmse, rvec, tvec, inl_bool)
+            else:
+                b_kin, b_inl, b_rmse = best_res[0], best_res[1], best_res[2]
+                if (kin_ok and not b_kin) or (
+                    kin_ok == b_kin and ((n_inl > b_inl) or (n_inl == b_inl and rmse < b_rmse))
+                ):
+                    best_res = (kin_ok, n_inl, rmse, rvec, tvec, inl_bool)
 
         if best_res is None:
             return False, None, None, np.zeros(len(pts3d), dtype=bool), 999.0
-        _, rmse, rvec, tvec, inl_bool = best_res
+        _, _, rmse, rvec, tvec, inl_bool = best_res
         return True, rvec, tvec, inl_bool, rmse
 
-    def _replenish_6dof_points(self, gray_track: np.ndarray, rvec: np.ndarray, tvec: np.ndarray) -> None:
-        """Project current mesh silhouette, detect interior corners, and lift onto 3D mesh surface."""
+    def _eval_6dof_edge_support(
+        self,
+        gray_track: np.ndarray,
+        rvec: np.ndarray,
+        tvec: np.ndarray,
+    ) -> tuple[float, np.ndarray]:
+        """Compute silhouette boundary edge-alignment support in [0, 1] and native depth buffer."""
         assert self.mesh is not None and self._K is not None
-        R, _ = cv2.Rodrigues(rvec)
+        R, _ = cv2.Rodrigues(rvec.astype(np.float64))
         verts_cam = (self.mesh.vertices.astype(np.float64) @ R.T + tvec.reshape(1, 3)).astype(np.float32)
         fx, fy, cx, cy = float(self._K[0, 0]), float(self._K[1, 1]), float(self._K[0, 2]), float(self._K[1, 2])
         dummy_rgb = np.zeros((self._frame_h, self._frame_w, 3), dtype=np.uint8)
@@ -1519,16 +1732,309 @@ class VideoSurfaceTracker:
             if (self._track_w != self._frame_w or self._track_h != self._frame_h)
             else sil_u8
         )
-        sil_track = cv2.erode(sil_track, np.ones((3, 3), np.uint8), iterations=1)
+        contours, _ = cv2.findContours(sil_track, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if not contours:
+            return 0.0, res.depth_buf
+        largest = max(contours, key=cv2.contourArea).reshape(-1, 2)
+        if len(largest) < 16:
+            return 0.0, res.depth_buf
+        idxs = np.linspace(0, len(largest) - 1, min(72, len(largest)), dtype=np.int32)
+        pts = largest[idxs].astype(np.float32)
+        # Mask normal via Sobel on sil_track
+        gx_m = cv2.Sobel(sil_track, cv2.CV_32F, 1, 0, ksize=3)
+        gy_m = cv2.Sobel(sil_track, cv2.CV_32F, 0, 1, ksize=3)
+        px_i = np.clip(pts[:, 0].astype(np.int32), 0, self._track_w - 1)
+        py_i = np.clip(pts[:, 1].astype(np.int32), 0, self._track_h - 1)
+        nrm = -np.column_stack([gx_m[py_i, px_i], gy_m[py_i, px_i]])
+        nmag = np.linalg.norm(nrm, axis=1)
+        ok_n = nmag > 1e-3
+        if int(np.count_nonzero(ok_n)) < 12:
+            return 0.5, res.depth_buf
+        pts = pts[ok_n]
+        nrm = nrm[ok_n] / nmag[ok_n, None]
+
+        # ROI-cropped image gradient along normal within +/-3 tracking pixels (10x faster on high-res frames)
+        pad_r = 12
+        rx0 = max(0, int(np.floor(pts[:, 0].min())) - pad_r)
+        ry0 = max(0, int(np.floor(pts[:, 1].min())) - pad_r)
+        rx1 = min(self._track_w, int(np.ceil(pts[:, 0].max())) + pad_r + 1)
+        ry1 = min(self._track_h, int(np.ceil(pts[:, 1].max())) + pad_r + 1)
+        sub_g = gray_track[ry0:ry1, rx0:rx1]
+        if sub_g.size == 0:
+            return 0.0, res.depth_buf
+        smooth = cv2.GaussianBlur(sub_g, (5, 5), 0.9)
+        ix = cv2.Sobel(smooth, cv2.CV_32F, 1, 0, ksize=3)
+        iy = cv2.Sobel(smooth, cv2.CV_32F, 0, 1, ksize=3)
+        sub_h, sub_w = sub_g.shape[:2]
+        pts_loc = pts - np.array([[float(rx0), float(ry0)]], dtype=np.float32)
+        steps = np.arange(-3, 4, dtype=np.float32)
+        samp = pts_loc[:, None, :] + nrm[:, None, :] * steps[None, :, None]
+        sx = np.clip(np.round(samp[:, :, 0]).astype(np.int32), 0, sub_w - 1)
+        sy = np.clip(np.round(samp[:, :, 1]).astype(np.int32), 0, sub_h - 1)
+        grad = np.stack([ix[sy, sx], iy[sy, sx]], axis=-1)
+        gmag = np.linalg.norm(grad, axis=-1)
+        align = np.abs(np.sum(grad * nrm[:, None, :], axis=-1)) / np.maximum(gmag, 1.0)
+        supported = np.any((gmag > 22.0) & (align > 0.58), axis=1)
+        return float(np.mean(supported)), res.depth_buf
+
+    def _refine_6dof_pose_silhouette(
+        self,
+        gray_track: np.ndarray,
+        rvec: np.ndarray,
+        tvec: np.ndarray,
+        depth_buf: np.ndarray,
+        edge_sup: float,
+        pts3d_inl: np.ndarray,
+        pts2d_native_inl: np.ndarray,
+        base_rmse: float,
+        res_scale: float,
+    ) -> tuple[np.ndarray, float, np.ndarray, float]:
+        """Fast 1-step IRLS Huber silhouette-edge alignment for (tx, ty, tz), strictly verified against KLT RMSE."""
+        assert self.mesh is not None and self._K is not None
+        sil_u8 = (depth_buf < 1e20).astype(np.uint8) * 255
+        sil_track = (
+            cv2.resize(sil_u8, (self._track_w, self._track_h), interpolation=cv2.INTER_NEAREST)
+            if (self._track_w != self._frame_w or self._track_h != self._frame_h)
+            else sil_u8
+        )
+        contours, _ = cv2.findContours(sil_track, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if not contours:
+            return tvec, edge_sup, depth_buf, base_rmse
+        largest = max(contours, key=cv2.contourArea).reshape(-1, 2)
+        if len(largest) < 24:
+            return tvec, edge_sup, depth_buf, base_rmse
+        idxs = np.linspace(0, len(largest) - 1, min(64, len(largest)), dtype=np.int32)
+        pts = largest[idxs].astype(np.float32)
+
+        # Exclude contour samples touching detected gripping hands/occluders so fingers never pull the pose
+        if self._last_occluder_mask_img is not None and self._last_occluder_mask_img.shape == (self._frame_h, self._frame_w):
+            p_nat = self._track_to_native(pts)
+            iu = np.clip(np.round(p_nat[:, 0]).astype(np.int32), 0, self._frame_w - 1)
+            iv = np.clip(np.round(p_nat[:, 1]).astype(np.int32), 0, self._frame_h - 1)
+            keep_c = self._last_occluder_mask_img[iv, iu] == 0
+            if int(np.count_nonzero(keep_c)) < 16:
+                return tvec, edge_sup, depth_buf, base_rmse
+            pts = pts[keep_c]
+
+        gx_m = cv2.Sobel(sil_track, cv2.CV_32F, 1, 0, ksize=3)
+        gy_m = cv2.Sobel(sil_track, cv2.CV_32F, 0, 1, ksize=3)
+        px_i = np.clip(pts[:, 0].astype(np.int32), 0, self._track_w - 1)
+        py_i = np.clip(pts[:, 1].astype(np.int32), 0, self._track_h - 1)
+        nrm = -np.column_stack([gx_m[py_i, px_i], gy_m[py_i, px_i]])
+        nmag = np.linalg.norm(nrm, axis=1)
+        ok_n = nmag > 1e-3
+        if int(np.count_nonzero(ok_n)) < 16:
+            return tvec, edge_sup, depth_buf, base_rmse
+        pts = pts[ok_n]
+        nrm = nrm[ok_n] / nmag[ok_n, None]
+
+        pad_r = 14
+        rx0 = max(0, int(np.floor(pts[:, 0].min())) - pad_r)
+        ry0 = max(0, int(np.floor(pts[:, 1].min())) - pad_r)
+        rx1 = min(self._track_w, int(np.ceil(pts[:, 0].max())) + pad_r + 1)
+        ry1 = min(self._track_h, int(np.ceil(pts[:, 1].max())) + pad_r + 1)
+        sub_g = gray_track[ry0:ry1, rx0:rx1]
+        if sub_g.size == 0:
+            return tvec, edge_sup, depth_buf, base_rmse
+        smooth = cv2.GaussianBlur(sub_g, (5, 5), 0.9)
+        ix = cv2.Sobel(smooth, cv2.CV_32F, 1, 0, ksize=3)
+        iy = cv2.Sobel(smooth, cv2.CV_32F, 0, 1, ksize=3)
+        sub_h, sub_w = sub_g.shape[:2]
+        pts_loc = pts - np.array([[float(rx0), float(ry0)]], dtype=np.float32)
+
+        steps = np.arange(-6, 7, dtype=np.float32)
+        samp = pts_loc[:, None, :] + nrm[:, None, :] * steps[None, :, None]
+        sx = np.clip(np.round(samp[:, :, 0]).astype(np.int32), 0, sub_w - 1)
+        sy = np.clip(np.round(samp[:, :, 1]).astype(np.int32), 0, sub_h - 1)
+        grad = np.stack([ix[sy, sx], iy[sy, sx]], axis=-1)
+        gmag = np.linalg.norm(grad, axis=-1)
+        align = np.abs(np.sum(grad * nrm[:, None, :], axis=-1)) / np.maximum(gmag, 1.0)
+        valid_e = (gmag > 22.0) & (align > 0.60)
+        # Prefer strong aligned edges close to current silhouette
+        score = np.where(valid_e, gmag * align / (1.0 + 0.14 * np.abs(steps)[None, :]), 0.0)
+        best_idx = np.argmax(score, axis=1)
+        has_e = score[np.arange(len(pts)), best_idx] > 0.0
+        if int(np.count_nonzero(has_e)) < 18:
+            return tvec, edge_sup, depth_buf, base_rmse
+
+        d_obs = steps[best_idx[has_e]].astype(np.float64)
+        med_abs_d = float(np.median(np.abs(d_obs)))
+        if med_abs_d < 0.80 or med_abs_d > 4.5:
+            return tvec, edge_sup, depth_buf, base_rmse
+
+        p_e = pts[has_e].astype(np.float64)
+        n_e = nrm[has_e].astype(np.float64)
+        ctr = p_e.mean(axis=0)
+        rad_n = np.sum((p_e - ctr[None, :]) * n_e, axis=1)
+        A = np.column_stack([n_e[:, 0], n_e[:, 1], rad_n])
+
+        # 2-iteration IRLS Huber least squares for (dx_track, dy_track, d_scale)
+        w = np.ones(len(d_obs), dtype=np.float64)
+        sol = np.zeros(3, dtype=np.float64)
+        for _ in range(2):
+            Aw = A * w[:, None]
+            H_sys = Aw.T @ A + np.diag([1e-3, 1e-3, 4.0])  # mild scale damping
+            try:
+                sol = np.linalg.solve(H_sys, Aw.T @ d_obs)
+            except np.linalg.LinAlgError:
+                return tvec, edge_sup, depth_buf, base_rmse
+            res_r = np.abs(A @ sol - d_obs)
+            w = np.where(res_r <= 1.8, 1.0, 1.8 / np.maximum(res_r, 1e-6))
+
+        dx_tr = float(np.clip(sol[0], -3.0, 3.0))
+        dy_tr = float(np.clip(sol[1], -3.0, 3.0))
+        ds = float(np.clip(sol[2], -0.035, 0.035))
+        if abs(dx_tr) < 0.35 and abs(dy_tr) < 0.35 and abs(ds) < 0.008:
+            return tvec, edge_sup, depth_buf, base_rmse
+
+        fx, fy = float(self._K[0, 0]), float(self._K[1, 1])
+        tz_old = float(tvec[2])
+        tz_new = float(np.clip(tz_old / (1.0 + ds), max(0.06, 0.55 * self._init_tz), 1.65 * self._init_tz))
+        tvec_new = tvec.copy()
+        tvec_new[0] = (tvec[0] + (dx_tr / max(self._sx, 1e-4)) * tz_old / fx) * (tz_new / tz_old)
+        tvec_new[1] = (tvec[1] + (dy_tr / max(self._sy, 1e-4)) * tz_old / fy) * (tz_new / tz_old)
+        tvec_new[2] = tz_new
+
+        # Verify KLT 3D-to-2D reprojection consistency before accepting!
+        if len(pts3d_inl) >= 8:
+            proj, _ = cv2.projectPoints(pts3d_inl, rvec, tvec_new, self._K, None)
+            errs = np.linalg.norm(proj.reshape(-1, 2) - pts2d_native_inl, axis=1)
+            new_rmse = float(math.sqrt(float(np.mean(errs ** 2))))
+            if new_rmse > base_rmse + 0.35 * res_scale:
+                return tvec, edge_sup, depth_buf, base_rmse
+        else:
+            new_rmse = base_rmse
+
+        new_es, new_dbuf = self._eval_6dof_edge_support(gray_track, rvec, tvec_new)
+        if new_es >= edge_sup + 0.05:
+            return tvec_new, new_es, new_dbuf, new_rmse
+        return tvec, edge_sup, depth_buf, base_rmse
+
+    def _eval_6dof_bg_empty_mask(
+        self,
+        frame_bgr: np.ndarray,
+        depth_buf: np.ndarray,
+    ) -> tuple[float, np.ndarray | None]:
+        """Return fraction and uint8 mask of 3D silhouette pixels matching the immediate exterior background color (and not target color)."""
+        lut = getattr(self, "_ref_6dof_lab_lut", None)
+        if lut is None:
+            return 0.0, None
+        sil = depth_buf < 1e20
+        ys, xs = np.nonzero(sil)
+        n_sil = len(xs)
+        if n_sil < 64:
+            return 0.0, None
+        h, w = frame_bgr.shape[:2]
+        pad = 22
+        x0 = max(0, int(xs.min()) - pad)
+        y0 = max(0, int(ys.min()) - pad)
+        x1 = min(w, int(xs.max()) + pad + 1)
+        y1 = min(h, int(ys.max()) + pad + 1)
+
+        roi_bgr = frame_bgr[y0:y1:2, x0:x1:2]
+        roi_sil = sil[y0:y1:2, x0:x1:2]
+        n_sil_sub = int(np.count_nonzero(roi_sil))
+        if n_sil_sub < 24:
+            return 0.0, None
+        sil_u8 = roi_sil.astype(np.uint8) * 255
+        ext_ring = (cv2.dilate(sil_u8, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))) > 0) & (~roi_sil)
+        if int(np.count_nonzero(ext_ring)) < 16:
+            return 0.0, None
+
+        roi_lab = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2LAB)
+        li = np.clip(roi_lab[:, :, 0] // 20, 0, 13)
+        ai = np.clip(roi_lab[:, :, 1] // 8, 0, 32)
+        bi = np.clip(roi_lab[:, :, 2] // 8, 0, 32)
+        in_target = lut[li, ai, bi]
+
+        bg_pts = roi_lab[ext_ring]
+        bg_cnt = np.zeros((14, 33, 33), dtype=np.int32)
+        np.add.at(
+            bg_cnt,
+            (
+                np.clip(bg_pts[:, 0] // 20, 0, 13),
+                np.clip(bg_pts[:, 1] // 8, 0, 32),
+                np.clip(bg_pts[:, 2] // 8, 0, 32),
+            ),
+            1,
+        )
+        bg_lut = bg_cnt >= max(6, int(0.03 * len(bg_pts)))
+        in_bg = bg_lut[li, ai, bi]
+
+        # Only count exterior-connected background regions leaking inside the silhouette
+        cand = (~roi_sil) | (roi_sil & (~in_target) & in_bg)
+        n_cc, lbls, _, _ = cv2.connectedComponentsWithStats(cand.astype(np.uint8), connectivity=4)
+        bg_in_sil = np.zeros(roi_sil.shape, dtype=bool)
+        if n_cc > 1:
+            flat = lbls.ravel()
+            ext_c = np.bincount(flat, weights=(~roi_sil).ravel().astype(np.float32), minlength=n_cc)
+            in_c = np.bincount(flat, weights=roi_sil.ravel().astype(np.float32), minlength=n_cc)
+            keep = np.zeros(n_cc, dtype=bool)
+            for c_id in range(1, n_cc):
+                if ext_c[c_id] >= 12 and in_c[c_id] >= 6:
+                    keep[c_id] = True
+            if np.any(keep):
+                bg_in_sil = keep[lbls] & roi_sil
+
+        n_bg_in = int(np.count_nonzero(bg_in_sil))
+        if n_bg_in == 0:
+            return 0.0, None
+        frac = float(n_bg_in) / float(n_sil_sub)
+        bg_up = cv2.resize(
+            np.where(bg_in_sil, np.uint8(255), np.uint8(0)),
+            (x1 - x0, y1 - y0),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        full_m = np.zeros((h, w), dtype=np.uint8)
+        full_m[y0:y1, x0:x1] = bg_up
+        return frac, full_m
+
+    def _replenish_6dof_points(
+        self,
+        gray_track: np.ndarray,
+        rvec: np.ndarray,
+        tvec: np.ndarray,
+        *,
+        depth_buf: np.ndarray | None = None,
+        bg_exclude_mask: np.ndarray | None = None,
+    ) -> None:
+        """Project current mesh silhouette, exclude detected hand/background pixels, and lift interior corners to 3D."""
+        assert self.mesh is not None and self._K is not None
+        R, _ = cv2.Rodrigues(rvec)
+        fx, fy, cx, cy = float(self._K[0, 0]), float(self._K[1, 1]), float(self._K[0, 2]), float(self._K[1, 2])
+        if depth_buf is None:
+            verts_cam = (self.mesh.vertices.astype(np.float64) @ R.T + tvec.reshape(1, 3)).astype(np.float32)
+            dummy_rgb = np.zeros((self._frame_h, self._frame_w, 3), dtype=np.uint8)
+            dummy_tex = np.full((4, 4, 4), 255, dtype=np.uint8)
+            res = rasterize_mesh_rgbd(
+                verts_cam, self.mesh.triangles, self.mesh.uvs, dummy_tex, (fx, fy, cx, cy), dummy_rgb,
+                opacity=0.0, blend_mode="normal",
+            )
+            depth_buf = res.depth_buf
+        sil_u8 = (depth_buf < 1e20).astype(np.uint8) * 255
+        # Strictly exclude detected foreground/hand occluder pixels so hands NEVER contaminate 3D points
+        if self._last_occluder_mask_img is not None and self._last_occluder_mask_img.shape == sil_u8.shape:
+            occ_dil = cv2.dilate(self._last_occluder_mask_img, np.ones((7, 7), np.uint8), iterations=1)
+            sil_u8 = cv2.bitwise_and(sil_u8, cv2.bitwise_not(occ_dil))
+        # Also exclude exterior-connected background overhang so empty tray/wall pixels NEVER get lifted to 3D
+        if bg_exclude_mask is not None and bg_exclude_mask.shape == sil_u8.shape:
+            bg_dil = cv2.dilate(bg_exclude_mask, np.ones((5, 5), np.uint8), iterations=1)
+            sil_u8 = cv2.bitwise_and(sil_u8, cv2.bitwise_not(bg_dil))
+        sil_track = (
+            cv2.resize(sil_u8, (self._track_w, self._track_h), interpolation=cv2.INTER_NEAREST)
+            if (self._track_w != self._frame_w or self._track_h != self._frame_h)
+            else sil_u8
+        )
+        sil_track = cv2.erode(sil_track, np.ones((5, 5), np.uint8), iterations=1)
+        if int(np.count_nonzero(sil_track)) < 48:
+            return
         new_track = self._detect_corners_in_mask(gray_track, sil_track)
         if len(new_track) == 0:
             return
         new_native = self._track_to_native(new_track)
-        u = new_native[:, 0]
-        v = new_native[:, 1]
-        iu = np.clip(np.round(u).astype(np.int32), 0, self._frame_w - 1)
-        iv = np.clip(np.round(v).astype(np.int32), 0, self._frame_h - 1)
-        z = res.depth_buf[iv, iu].astype(np.float64)
+        iu = np.clip(np.round(new_native[:, 0]).astype(np.int32), 0, self._frame_w - 1)
+        iv = np.clip(np.round(new_native[:, 1]).astype(np.int32), 0, self._frame_h - 1)
+        z = depth_buf[iv, iu].astype(np.float64)
         valid = np.isfinite(z) & (z > 0.03) & (z < 100.0)
         if not np.any(valid):
             return
@@ -1551,8 +2057,63 @@ class VideoSurfaceTracker:
             self._curr_pts_track = add_track[: self.max_klt_points].astype(np.float32)
             self._curr_pts3d = p_obj[: self.max_klt_points]
 
+    def _maybe_store_6dof_keyframe(
+        self,
+        frame_bgr: np.ndarray,
+        gray_track: np.ndarray,
+        rvec: np.ndarray,
+        tvec: np.ndarray,
+        depth_buf: np.ndarray,
+    ) -> None:
+        """Insert a new verified 3D viewpoint into the multi-keyframe bank ONLY when pose & silhouette are independently verified."""
+        if len(self._mesh_keyframes) >= 12 or self._K is None:
+            return
+        R_cur, _ = cv2.Rodrigues(rvec.astype(np.float64))
+        for kf_r, _, _, _ in self._mesh_keyframes:
+            R_kf, _ = cv2.Rodrigues(kf_r.astype(np.float64))
+            ang = math.acos(float(np.clip((np.trace(R_cur @ R_kf.T) - 1.0) * 0.5, -1.0, 1.0)))
+            if math.degrees(ang) < 16.0:
+                return  # Already have a verified keyframe near this viewpoint
+
+        sil_u8 = (depth_buf < 1e20).astype(np.uint8) * 255
+        if self._last_occluder_mask_img is not None and self._last_occluder_mask_img.shape == sil_u8.shape:
+            occ_dil = cv2.dilate(self._last_occluder_mask_img, np.ones((7, 7), np.uint8), iterations=1)
+            sil_u8 = cv2.bitwise_and(sil_u8, cv2.bitwise_not(occ_dil))
+        sil_u8 = cv2.erode(sil_u8, np.ones((5, 5), np.uint8), iterations=1)
+
+        if self._use_native_recovery:
+            gray_src = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            kps, descs = self._orb_recovery.detectAndCompute(gray_src, sil_u8)
+            if descs is None or len(kps) < 16:
+                return
+            pts_native = np.array([kp.pt for kp in kps], dtype=np.float32)
+        else:
+            sil_tr = (
+                cv2.resize(sil_u8, (self._track_w, self._track_h), interpolation=cv2.INTER_NEAREST)
+                if (self._track_w != self._frame_w or self._track_h != self._frame_h)
+                else sil_u8
+            )
+            kps, descs = self._orb_recovery.detectAndCompute(gray_track, sil_tr)
+            if descs is None or len(kps) < 16:
+                return
+            pts_native = self._track_to_native(np.array([kp.pt for kp in kps], dtype=np.float32))
+
+        fx, fy, cx, cy = float(self._K[0, 0]), float(self._K[1, 1]), float(self._K[0, 2]), float(self._K[1, 2])
+        iu = np.clip(np.round(pts_native[:, 0]).astype(np.int32), 0, self._frame_w - 1)
+        iv = np.clip(np.round(pts_native[:, 1]).astype(np.int32), 0, self._frame_h - 1)
+        z = depth_buf[iv, iu].astype(np.float64)
+        valid = np.isfinite(z) & (z > 0.03) & (z < 100.0)
+        if int(np.count_nonzero(valid)) < 16:
+            return
+        uv_ok = pts_native[valid].astype(np.float64)
+        z_ok = z[valid]
+        p_cam = np.column_stack([(uv_ok[:, 0] - cx) * z_ok / fx, (uv_ok[:, 1] - cy) * z_ok / fy, z_ok])
+        p_obj = (p_cam - tvec.reshape(1, 3)) @ R_cur
+        self._mesh_keyframes.append((rvec.copy(), tvec.copy(), p_obj[:600], descs[valid][:600].copy()))
+
     def _track_frame_6dof(
         self,
+        frame_bgr: np.ndarray,
         gray_track: np.ndarray,
         frame_index: int,
         timestamp_s: float,
@@ -1562,9 +2123,25 @@ class VideoSurfaceTracker:
 
         if self._state == "tracking":
             p1_track, good = self._run_fb_klt(gray_track, self._curr_pts_track)
+            prev_track = self._curr_pts_track[good]
             cur_track = p1_track[good]
             cur_pts3d = self._curr_pts3d[good]
             cur_native = self._track_to_native(cur_track)
+
+            # Filter out KLT points sitting inside detected hand/occluder mask BEFORE PnP
+            if (
+                self._last_occluder_mask_img is not None
+                and len(cur_native) >= 16
+                and self._last_occluder_mask_img.shape == (self._frame_h, self._frame_w)
+            ):
+                iu = np.clip(np.round(cur_native[:, 0]).astype(np.int32), 0, self._frame_w - 1)
+                iv = np.clip(np.round(cur_native[:, 1]).astype(np.int32), 0, self._frame_h - 1)
+                unocc = self._last_occluder_mask_img[iv, iu] == 0
+                if int(np.count_nonzero(unocc)) >= 12:
+                    prev_track = prev_track[unocc]
+                    cur_track = cur_track[unocc]
+                    cur_pts3d = cur_pts3d[unocc]
+                    cur_native = cur_native[unocc]
 
             prior = (self._last_rvec, self._last_tvec) if (self._last_rvec is not None and self._last_tvec is not None) else None
             ok, rvec, tvec, inl_bool, rmse = self._solve_pnp_robust(cur_pts3d, cur_native, prior)
@@ -1572,7 +2149,7 @@ class VideoSurfaceTracker:
             # Causal symmetry disambiguation on early frames (frame 1..3) if alternate silhouette hypotheses exist
             if self._alt_hypotheses and frame_index <= 3:
                 best_rmse = rmse if ok else 999.0
-                best_choice: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float] | None = None
+                best_choice: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float] | None = None
                 surviving_alts = []
                 for alt_r, alt_t, alt_trk, alt_3d in self._alt_hypotheses:
                     ap1, ag = self._run_fb_klt(gray_track, alt_trk)
@@ -1584,25 +2161,125 @@ class VideoSurfaceTracker:
                             surviving_alts.append((ar, at, ap1[ag][ainl], alt_3d[ag][ainl]))
                             if armse + 0.25 < best_rmse and int(np.count_nonzero(ainl)) >= 12:
                                 best_rmse = armse
-                                best_choice = (ar, at, ap1[ag], alt_3d[ag], ainl, armse)
+                                best_choice = (ar, at, alt_trk[ag], ap1[ag], alt_3d[ag], ainl, armse)
                 if best_choice is not None:
-                    rvec, tvec, cur_track, cur_pts3d, inl_bool, rmse = best_choice
+                    rvec, tvec, prev_track, cur_track, cur_pts3d, inl_bool, rmse = best_choice
+                    cur_native = self._track_to_native(cur_track)
                     ok = True
                 self._alt_hypotheses = surviving_alts if frame_index < 3 else []
 
-            if ok and rvec is not None and tvec is not None and rmse <= 6.0:
+            # Kinematic jump & implausible depth-drift guard
+            res_scale = max(1.0, float(self._frame_h) / 480.0)
+            if ok and rvec is not None and tvec is not None:
+                if tvec[2] < max(0.06, 0.50 * self._init_tz) or tvec[2] > 1.75 * self._init_tz:
+                    ok = False
+                elif self._last_rvec is not None and self._last_tvec is not None:
+                    R_new, _ = cv2.Rodrigues(rvec)
+                    R_old, _ = cv2.Rodrigues(self._last_rvec)
+                    d_ang = math.degrees(math.acos(float(np.clip((np.trace(R_new @ R_old.T) - 1.0) * 0.5, -1.0, 1.0))))
+                    d_tr = float(np.linalg.norm(tvec - self._last_tvec))
+                    if d_ang > 32.0 or d_tr > max(0.20, 0.45 * self._init_tz):
+                        ok = False
+
+            if ok and rvec is not None and tvec is not None and rmse <= 6.0 * res_scale:
                 n_inl = int(np.count_nonzero(inl_bool))
+                edge_sup, depth_buf = self._eval_6dof_edge_support(gray_track, rvec, tvec)
+
+                # Measure 2D horizontal span of inliers relative to projected mesh width (detects grazing-strip PnP degeneracy)
+                xs_sil = np.nonzero(depth_buf < 1e20)[1]
+                sil_w_native = float(xs_sil.max() - xs_sil.min()) if len(xs_sil) >= 16 else 32.0
+                inl_native = cur_native[inl_bool]
+                xspan_native = float(inl_native[:, 0].max() - inl_native[:, 0].min()) if len(inl_native) >= 4 else 0.0
+                xspan_ratio = xspan_native / max(sil_w_native, 12.0)
+
+                # 1-step IRLS Huber silhouette-edge refinement strictly bounded by KLT RMSE (+0.35*res_scale)
+                if edge_sup < 0.72:
+                    tvec, edge_sup, depth_buf, rmse = self._refine_6dof_pose_silhouette(
+                        gray_track,
+                        rvec,
+                        tvec,
+                        depth_buf,
+                        edge_sup,
+                        cur_pts3d[inl_bool],
+                        inl_native,
+                        rmse,
+                        res_scale,
+                    )
+
+                # Guard against grazing-strip depth runaway ONLY when points collapsed onto a narrow limb (< 35% width)
+                if (
+                    xspan_ratio < 0.35
+                    and self._last_tvec is not None
+                    and self._last_tvec[2] > 0.04
+                ):
+                    prev_tz = float(self._last_tvec[2])
+                    z_ratio = float(tvec[2]) / prev_tz
+                    if z_ratio > 1.035 or z_ratio < 0.965:
+                        clamped_tz = float(np.clip(tvec[2], prev_tz * 0.965, prev_tz * 1.035))
+                        scale_z = clamped_tz / max(float(tvec[2]), 1e-4)
+                        t_cand = tvec.copy()
+                        t_cand[0] *= scale_z
+                        t_cand[1] *= scale_z
+                        t_cand[2] = clamped_tz
+                        proj_c, _ = cv2.projectPoints(cur_pts3d[inl_bool], rvec, t_cand, self._K, None)
+                        rmse_c = float(math.sqrt(float(np.mean(np.sum((proj_c.reshape(-1, 2) - inl_native) ** 2, axis=1)))))
+                        if rmse_c <= max(rmse + 1.2 * res_scale, 4.0 * res_scale):
+                            tvec = t_cand
+                            rmse = rmse_c
+                            edge_sup, depth_buf = self._eval_6dof_edge_support(gray_track, rvec, tvec)
+
+                # Explicit AMBIGUOUS gate: thin geometric support, grazing collapse, drifted depth, or off-object background drift
+                bg_empty_frac, bg_mask_img = self._eval_6dof_bg_empty_mask(frame_bgr, depth_buf)
+                tz_rel = float(tvec[2]) / max(self._init_tz, 1e-4)
+                strong_geom = (n_inl >= 35) and (rmse <= 3.5 * res_scale) and (0.65 <= tz_rel <= 1.40)
+                bg_drifted = (bg_empty_frac > 0.52) or (bg_empty_frac > 0.42 and edge_sup < 0.45)
+                is_ambiguous = bg_drifted or (
+                    (not strong_geom)
+                    and (
+                        (n_inl < 14 and edge_sup < 0.42)
+                        or (rmse > 4.2 * res_scale and edge_sup < 0.40)
+                        or (xspan_ratio < 0.24 and n_inl < 30)
+                        or ((tz_rel > 1.42 or tz_rel < 0.62) and edge_sup < 0.62)
+                    )
+                )
+                if is_ambiguous:
+                    self._state = "recovering"
+                    self._cand_pose = (rvec.copy(), tvec.copy())
+                    self._prev_gray = gray_track
+                    track_ms = (time.perf_counter() - t0) * 1000.0
+                    return TrackFrameResult(
+                        frame_index=int(frame_index),
+                        timestamp_s=float(timestamp_s),
+                        state="recovering",
+                        inliers=n_inl,
+                        confidence=0.0,
+                        track_ms=track_ms,
+                        confidence_state="AMBIGUOUS",
+                    )
+
                 self._last_rvec = rvec.copy()
                 self._last_tvec = tvec.copy()
+                ys_sil, xs_sil_u = np.nonzero(depth_buf < 1e20)
+                if len(xs_sil_u) >= 16:
+                    x0_s, x1_s = int(xs_sil_u.min()), int(xs_sil_u.max())
+                    y0_s, y1_s = int(ys_sil.min()), int(ys_sil.max())
+                    self._last_sil_bbox = (x0_s, y0_s, max(8, x1_s - x0_s), max(8, y1_s - y0_s))
                 self._curr_pts_track = cur_track[inl_bool].astype(np.float32)
                 self._curr_pts3d = cur_pts3d[inl_bool]
                 self._reproj_errors.append(rmse)
                 self._frames_since_replenish += 1
-                if len(self._curr_pts_track) < int(self.max_klt_points * 0.55) or self._frames_since_replenish >= 10:
-                    self._replenish_6dof_points(gray_track, rvec, tvec)
+
+                # Only replenish 3D points & store verified keyframes when pose, span, depth, and silhouette are independently solid
+                if edge_sup >= 0.38 and rmse <= 3.5 * res_scale and (0.68 <= tz_rel <= 1.38) and bg_empty_frac < 0.40 and (
+                    len(self._curr_pts_track) < int(self.max_klt_points * 0.55) or self._frames_since_replenish >= 10
+                ):
+                    self._replenish_6dof_points(gray_track, rvec, tvec, depth_buf=depth_buf, bg_exclude_mask=bg_mask_img)
                     self._frames_since_replenish = 0
+                if edge_sup >= 0.48 and rmse <= 2.6 * res_scale and n_inl >= 24 and xspan_ratio >= 0.40 and (0.72 <= tz_rel <= 1.35) and bg_empty_frac < 0.28:
+                    self._maybe_store_6dof_keyframe(frame_bgr, gray_track, rvec, tvec, depth_buf)
+
                 self._prev_gray = gray_track
-                conf = float(np.clip(n_inl / max(float(len(cur_pts3d)), 1.0), 0.0, 1.0))
+                conf = float(np.clip(0.65 * (n_inl / max(float(len(cur_pts3d)), 1.0)) + 0.35 * edge_sup, 0.0, 1.0))
                 track_ms = (time.perf_counter() - t0) * 1000.0
                 return TrackFrameResult(
                     frame_index=int(frame_index),
@@ -1613,6 +2290,7 @@ class VideoSurfaceTracker:
                     inliers=n_inl,
                     confidence=conf,
                     track_ms=track_ms,
+                    confidence_state="TRACKING",
                 )
 
             self._state = "lost"
@@ -1630,64 +2308,120 @@ class VideoSurfaceTracker:
                 inliers=0,
                 confidence=0.0,
                 track_ms=track_ms,
+                confidence_state="LOST",
             )
 
-        # Lost / recovering in 6-DoF: ORB matching against 3D reference bank
-        if self._mesh_descs_bank is not None and len(self._mesh_descs_bank) >= 10:
-            kps, descs = self._orb.detectAndCompute(gray_track, None)
-            if descs is not None and len(kps) >= 8:
-                knn = self._bf.knnMatch(descs, self._mesh_descs_bank, k=2)
-                best_by_ref: dict[int, tuple[float, tuple[float, float]]] = {}
-                for pair in knn:
-                    if len(pair) < 2:
+        # Lost / recovering in 6-DoF: match against verified multi-keyframe 3D bank (full-frame + causal local ROI)
+        res_scale = max(1.0, float(self._frame_h) / 480.0)
+        kf_bank = self._mesh_keyframes if self._mesh_keyframes else (
+            [(np.zeros(3), np.array([0.0, 0.0, self._init_tz]), self._mesh_pts3d_bank, self._mesh_descs_bank)]
+            if (self._mesh_descs_bank is not None and len(self._mesh_descs_bank) >= 10)
+            else []
+        )
+        if kf_bank:
+            if self._use_native_recovery:
+                gray_rec = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+                is_native = True
+            else:
+                gray_rec = gray_track
+                is_native = False
+
+            search_views: list[tuple[list[cv2.KeyPoint], np.ndarray | None, float, float]] = []
+            kps_full, descs_full = self._orb_recovery.detectAndCompute(gray_rec, None)
+            if descs_full is not None and len(kps_full) >= 8:
+                search_views.append((kps_full, descs_full, 0.0, 0.0))
+
+            # Causal local 3x ROI around last verified silhouette bbox increases keypoint density on small rotating objects
+            if is_native and getattr(self, "_last_sil_bbox", None) is not None:
+                lbx, lby, lbw, lbh = self._last_sil_bbox
+                rx0 = max(0, lbx - lbw)
+                ry0 = max(0, lby - lbh)
+                rx1 = min(self._frame_w, lbx + 2 * lbw)
+                ry1 = min(self._frame_h, lby + 2 * lbh)
+                if (rx1 - rx0) >= 48 and (ry1 - ry0) >= 48 and (rx1 - rx0) * (ry1 - ry0) < int(0.65 * self._frame_w * self._frame_h):
+                    kps_roi, descs_roi = self._orb_recovery.detectAndCompute(gray_rec[ry0:ry1, rx0:rx1], None)
+                    if descs_roi is not None and len(kps_roi) >= 8:
+                        search_views.append((kps_roi, descs_roi, float(rx0), float(ry0)))
+
+            best_cand: tuple[int, float, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
+            for kps, descs, ox, oy in search_views:
+                if descs is None:
+                    continue
+                for _, _, kf_pts3d, kf_descs in kf_bank:
+                    if kf_descs is None or len(kf_descs) < 10:
                         continue
-                    m, n = pair
-                    if m.distance < 0.78 * n.distance and m.distance <= 62:
-                        prev = best_by_ref.get(m.trainIdx)
-                        if prev is None or m.distance < prev[0]:
-                            best_by_ref[m.trainIdx] = (m.distance, kps[m.queryIdx].pt)
-                if len(best_by_ref) >= 10:
-                    idxs = sorted(best_by_ref.keys())
-                    cur_track = np.array([best_by_ref[i][1] for i in idxs], dtype=np.float32)
-                    cur_native = self._track_to_native(cur_track)
-                    pts3d = self._mesh_pts3d_bank[idxs]
-                    ok, rvec, tvec, inl_bool, rmse = self._solve_pnp_robust(pts3d, cur_native, None)
-                    if ok and rvec is not None and tvec is not None and rmse <= 5.0:
-                        n_inl = int(np.count_nonzero(inl_bool))
-                        self._prev_gray = gray_track
-                        if self._state == "recovering" and self._cand_pose is not None:
-                            dt = float(np.linalg.norm(tvec - self._cand_pose[1]))
-                            if dt <= 0.15:
-                                self._state = "tracking"
-                                self._last_rvec = rvec.copy()
-                                self._last_tvec = tvec.copy()
-                                self._cand_pose = None
-                                self._curr_pts_track = cur_track[inl_bool].astype(np.float32)
-                                self._curr_pts3d = pts3d[inl_bool]
-                                self._reproj_errors.append(rmse)
-                                self._replenish_6dof_points(gray_track, rvec, tvec)
-                                track_ms = (time.perf_counter() - t0) * 1000.0
-                                return TrackFrameResult(
-                                    frame_index=int(frame_index),
-                                    timestamp_s=float(timestamp_s),
-                                    state="tracking",
-                                    pose_rvec=rvec.copy(),
-                                    pose_tvec=tvec.copy(),
-                                    inliers=n_inl,
-                                    confidence=float(np.clip(n_inl / max(float(len(pts3d)), 1.0), 0.0, 1.0)),
-                                    track_ms=track_ms,
-                                )
-                        self._state = "recovering"
-                        self._cand_pose = (rvec.copy(), tvec.copy())
-                        track_ms = (time.perf_counter() - t0) * 1000.0
-                        return TrackFrameResult(
-                            frame_index=int(frame_index),
-                            timestamp_s=float(timestamp_s),
-                            state="recovering",
-                            inliers=n_inl,
-                            confidence=0.0,
-                            track_ms=track_ms,
-                        )
+                    knn = self._bf.knnMatch(descs, kf_descs, k=2)
+                    best_by_ref: dict[int, tuple[float, tuple[float, float]]] = {}
+                    for pair in knn:
+                        if len(pair) < 2:
+                            continue
+                        m, n = pair
+                        if m.distance < 0.78 * n.distance and m.distance <= 62:
+                            prev = best_by_ref.get(m.trainIdx)
+                            if prev is None or m.distance < prev[0]:
+                                pt = kps[m.queryIdx].pt
+                                best_by_ref[m.trainIdx] = (m.distance, (pt[0] + ox, pt[1] + oy))
+                    if len(best_by_ref) >= 12:
+                        idxs = sorted(best_by_ref.keys())
+                        cur_pts = np.array([best_by_ref[i][1] for i in idxs], dtype=np.float32)
+                        cur_native = cur_pts if is_native else self._track_to_native(cur_pts)
+                        cur_track = self._native_to_track(cur_native) if is_native else cur_pts
+                        pts3d = kf_pts3d[idxs]
+                        ok, rvec, tvec, inl_bool, rmse = self._solve_pnp_robust(pts3d, cur_native, None)
+                        if ok and rvec is not None and tvec is not None and rmse <= 4.2 * res_scale:
+                            if not (max(0.06, 0.55 * self._init_tz) <= tvec[2] <= 1.60 * self._init_tz):
+                                continue
+                            n_inl = int(np.count_nonzero(inl_bool))
+                            if n_inl < 12:
+                                continue
+                            if best_cand is None or n_inl > best_cand[0] or (n_inl == best_cand[0] and rmse < best_cand[1]):
+                                best_cand = (n_inl, rmse, rvec, tvec, cur_track[inl_bool], pts3d[inl_bool], inl_bool)
+                if best_cand is not None and best_cand[0] >= 24:
+                    break
+
+            if best_cand is not None:
+                n_inl, rmse, rvec, tvec, inl_track, inl_pts3d, _ = best_cand
+                edge_sup, depth_buf = self._eval_6dof_edge_support(gray_track, rvec, tvec)
+                self._prev_gray = gray_track
+                if edge_sup >= 0.40:
+                    if self._state == "recovering" and self._cand_pose is not None:
+                        dt = float(np.linalg.norm(tvec - self._cand_pose[1]))
+                        R1, _ = cv2.Rodrigues(rvec)
+                        R0, _ = cv2.Rodrigues(self._cand_pose[0])
+                        d_ang = math.degrees(math.acos(float(np.clip((np.trace(R1 @ R0.T) - 1.0) * 0.5, -1.0, 1.0))))
+                        if dt <= 0.14 and d_ang <= 22.0:
+                            self._state = "tracking"
+                            self._last_rvec = rvec.copy()
+                            self._last_tvec = tvec.copy()
+                            self._cand_pose = None
+                            self._curr_pts_track = inl_track.astype(np.float32)
+                            self._curr_pts3d = inl_pts3d
+                            self._reproj_errors.append(rmse)
+                            self._replenish_6dof_points(gray_track, rvec, tvec, depth_buf=depth_buf)
+                            track_ms = (time.perf_counter() - t0) * 1000.0
+                            return TrackFrameResult(
+                                frame_index=int(frame_index),
+                                timestamp_s=float(timestamp_s),
+                                state="tracking",
+                                pose_rvec=rvec.copy(),
+                                pose_tvec=tvec.copy(),
+                                inliers=n_inl,
+                                confidence=float(np.clip(0.65 * (n_inl / 24.0) + 0.35 * edge_sup, 0.0, 1.0)),
+                                track_ms=track_ms,
+                                confidence_state="TRACKING",
+                            )
+                    self._state = "recovering"
+                    self._cand_pose = (rvec.copy(), tvec.copy())
+                    track_ms = (time.perf_counter() - t0) * 1000.0
+                    return TrackFrameResult(
+                        frame_index=int(frame_index),
+                        timestamp_s=float(timestamp_s),
+                        state="recovering",
+                        inliers=n_inl,
+                        confidence=0.0,
+                        track_ms=track_ms,
+                        confidence_state="RECOVERING",
+                    )
 
         self._prev_gray = gray_track
         self._state = "lost"
@@ -1700,4 +2434,5 @@ class VideoSurfaceTracker:
             inliers=0,
             confidence=0.0,
             track_ms=track_ms,
+            confidence_state="LOST",
         )

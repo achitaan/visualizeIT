@@ -105,3 +105,200 @@ def test_phase4_four_state_confidence_contract() -> None:
     assert tr_lost.confidence_state == "LOST"
     with pytest.raises(ContractValidationError):
         TrackFrameResult(frame_index=3, timestamp_s=0.1, state="lost", confidence_state="INVALID")  # type: ignore[arg-type]
+
+
+def _make_textured_card_frame(
+    w: int = 320,
+    h: int = 240,
+    dx: int = 0,
+    dy: int = 0,
+) -> tuple[np.ndarray, tuple[float, float, float, float]]:
+    rng = np.random.default_rng(123)
+    img = np.full((h, w, 3), (30, 35, 40), dtype=np.uint8)
+    x0, y0, bw, bh = 80 + dx, 50 + dy, 150, 130
+    cv2.rectangle(img, (x0, y0), (x0 + bw, y0 + bh), (210, 190, 160), -1)
+    for _ in range(45):
+        px = int(rng.integers(x0 + 8, x0 + bw - 18))
+        py = int(rng.integers(y0 + 8, y0 + bh - 18))
+        col = tuple(int(c) for c in rng.integers(20, 230, size=3))
+        cv2.rectangle(img, (px, py), (px + 12, py + 10), col, -1)
+    cv2.putText(img, "VIZ", (x0 + 25, y0 + 85), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (20, 20, 180), 3)
+    return img, (float(x0), float(y0), float(bw), float(bh))
+
+
+def test_confidence_state_transitions_suppress_rendering_and_freeze_memory() -> None:
+    """TRACKING -> LOST -> RECOVERING -> TRACKING suppresses rendering and freezes memory on non-TRACKING states."""
+    from visualizeit.contracts import DesignSpec
+    from visualizeit.pipeline import VideoPipelineSession
+
+    f0, bbox = _make_textured_card_frame()
+    art = np.zeros((96, 96, 4), dtype=np.uint8)
+    art[:, :] = (30, 40, 220, 255)
+    from pathlib import Path
+    tmp_art = Path(".cache/tmp/test_vq_art.png")
+    tmp_art.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(tmp_art), art)
+
+    sess = VideoPipelineSession(
+        design=DesignSpec(source="image", image_path=str(tmp_art)),
+        placement=PlacementSpec(wrap_mode="planar", blend_mode="normal", opacity=0.9),
+        local_occlusion_mask=True,
+    )
+    sel = SelectionSpec(
+        frame_index=0,
+        positive_points=[(bbox[0] + bbox[2] * 0.5, bbox[1] + bbox[3] * 0.5)],
+        bbox=bbox,
+    )
+    r0 = sess.initialize(f0, sel, timestamp_s=0.0)
+    assert r0.track_result.confidence_state == "TRACKING"
+    assert r0.rendered_mask is not None and int(np.count_nonzero(r0.rendered_mask)) > 1000
+    assert not np.array_equal(r0.frame_bgr, f0)
+    kf_before_loss = len(sess.tracker._ref_keyframes)
+
+    # Full blackout -> LOST: must suppress rendering, reset compositor occlusion memory, and NOT add keyframes
+    blank = np.zeros_like(f0)
+    r_lost = sess.process_frame(blank, 1, 0.033)
+    assert r_lost.track_result.state == "lost"
+    assert r_lost.track_result.confidence_state == "LOST"
+    assert r_lost.rendered_mask is None
+    assert np.array_equal(r_lost.frame_bgr, blank)
+    assert sess.compositor._occ_prev_vis is None
+    assert len(sess.tracker._ref_keyframes) == kf_before_loss
+
+    # 1st clean frame back -> RECOVERING (single-frame unconfirmed candidate MUST still suppress rendering!)
+    f_back, _ = _make_textured_card_frame(dx=2, dy=1)
+    r_rec1 = sess.process_frame(f_back, 2, 0.066)
+    assert r_rec1.track_result.state == "recovering"
+    assert r_rec1.track_result.confidence_state == "RECOVERING"
+    assert r_rec1.rendered_mask is None
+    assert np.array_equal(r_rec1.frame_bgr, f_back)
+
+    # 2nd consistent clean frame -> confirmed TRACKING, overlay restored!
+    f_back2, _ = _make_textured_card_frame(dx=3, dy=1)
+    r_rec2 = sess.process_frame(f_back2, 3, 0.100)
+    assert r_rec2.track_result.state == "tracking"
+    assert r_rec2.track_result.confidence_state == "TRACKING"
+    assert r_rec2.rendered_mask is not None and int(np.count_nonzero(r_rec2.rendered_mask)) > 1000
+    assert not np.array_equal(r_rec2.frame_bgr, f_back2)
+
+
+def test_false_recovery_rejection_on_inconsistent_pose_jump() -> None:
+    """Inconsistent 2nd recovery candidate (large pose jump) MUST NOT falsely confirm TRACKING."""
+    f0, bbox = _make_textured_card_frame()
+    sel = SelectionSpec(
+        frame_index=0,
+        positive_points=[(bbox[0] + bbox[2] * 0.5, bbox[1] + bbox[3] * 0.5)],
+        bbox=bbox,
+    )
+    seg = segment_frame(f0, sel, sharp_onboarding=True)
+    tracker = VideoSurfaceTracker(wrap_mode="planar")
+    r0 = tracker.initialize(f0, seg)
+    assert r0.state == "tracking"
+
+    # Force LOST
+    blank = np.zeros_like(f0)
+    r_lost = tracker.track_frame(blank, 1, 0.033)
+    assert r_lost.state == "lost"
+
+    # 1st candidate at dx=0 -> RECOVERING
+    r_c1 = tracker.track_frame(f0, 2, 0.066)
+    assert r_c1.state == "recovering"
+    assert r_c1.homography_3x3 is None
+
+    # 2nd candidate shifted wildly by +75px -> inconsistent with 1st candidate -> MUST NOT confirm TRACKING!
+    f_jump, _ = _make_textured_card_frame(dx=75, dy=30)
+    r_c2 = tracker.track_frame(f_jump, 3, 0.100)
+    assert r_c2.state != "tracking", "Tracker falsely confirmed recovery across a 75px inconsistent pose jump!"
+    assert r_c2.homography_3x3 is None
+
+
+def test_ambiguous_state_suppresses_compositor_and_resets_temporal_memory() -> None:
+    """Compositor returns untouched input frame and clears temporal visibility memory on AMBIGUOUS/LOST/RECOVERING."""
+    f0, bbox = _make_textured_card_frame()
+    art = np.full((64, 64, 4), (40, 40, 220, 255), dtype=np.uint8)
+    comp = SurfaceCompositor(
+        art,
+        PlacementSpec(wrap_mode="planar", blend_mode="normal", opacity=0.9),
+        ref_bbox=tuple(int(v) for v in bbox),
+        ref_frame_bgr=f0,
+        local_occlusion_mask=True,
+    )
+    tr_ok = TrackFrameResult(frame_index=0, timestamp_s=0.0, state="tracking", homography_3x3=np.eye(3), inliers=50, confidence=0.95)
+    out0, m0, _ = comp.composite(f0, tr_ok)
+    assert m0 is not None and comp._occ_prev_vis is not None
+    assert not np.array_equal(out0, f0)
+
+    for st, cst in [("recovering", "AMBIGUOUS"), ("recovering", "RECOVERING"), ("lost", "LOST")]:
+        tr_bad = TrackFrameResult(frame_index=1, timestamp_s=0.033, state=st, inliers=0, confidence=0.0, confidence_state=cst)
+        out_b, m_b, _ = comp.composite(f0, tr_bad)
+        assert m_b is None
+        assert np.array_equal(out_b, f0)
+        assert comp._occ_prev_vis is None
+        assert comp.last_occluder_mask_img is None
+
+
+def test_6dof_target_color_lut_protects_reddish_bottle_and_excludes_gripping_hand() -> None:
+    """Target Lab LUT prevents reddish-orange bottles from being misclassified as skin while still excluding exterior beige hands."""
+    img = np.full((360, 480, 3), (25, 25, 25), dtype=np.uint8)
+    # Reddish-orange bottle (deep orange-red BGR=(28, 62, 168)) in center
+    img[90:270, 200:280] = (28, 62, 168)
+    cv2.putText(img, "BBQ", (208, 185), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (235, 235, 235), 2)
+    mask = np.zeros((360, 480), dtype=np.uint8)
+    mask[90:270, 200:280] = 255
+
+    mesh = build_parametric_mesh("cylinder", cyl_radius=0.032, cyl_height=0.14)
+    intr = (500.0, 500.0, 240.0, 180.0)
+    init_pose = (np.zeros(3, dtype=np.float64), np.array([0.0, 0.0, 0.42], dtype=np.float64))
+    art = np.full((96, 96, 4), (220, 40, 40, 255), dtype=np.uint8)
+    comp = SurfaceCompositor(
+        art,
+        PlacementSpec(wrap_mode="mesh_6dof", blend_mode="normal", opacity=0.9),
+        ref_bbox=(200, 90, 80, 180),
+        ref_mask=mask,
+        ref_frame_bgr=img,
+        mesh=mesh,
+        intrinsics=intr,
+        init_pose=init_pose,
+        local_occlusion_mask=True,
+    )
+    # Frame 0 (no hand): target Lab LUT must produce ZERO false hand pixels on the reddish-orange bottle
+    hand0 = comp._compute_6dof_exterior_hand_mask(img, mask)
+    assert hand0 is None or int(np.count_nonzero(hand0 & mask)) == 0
+
+    # Frame 1: beige/pink hand entering from left exterior across middle of bottle
+    img_hand = img.copy()
+    cv2.rectangle(img_hand, (130, 155), (255, 200), (155, 175, 218), -1)  # BGR realistic light skin
+    hand1 = comp._compute_6dof_exterior_hand_mask(img_hand, mask)
+    assert hand1 is not None
+    hand_on_bottle = float(np.mean(hand1[160:195, 205:250] > 0))
+    clean_bottle = float(np.mean(hand1[100:145, 210:270] > 0))
+    assert hand_on_bottle > 0.70, f"Exterior gripping hand not detected: {hand_on_bottle:.3f}"
+    assert clean_bottle < 0.05, f"Non-occluded reddish bottle falsely flagged as hand: {clean_bottle:.3f}"
+
+
+def test_6dof_degraded_frame_never_inserts_corrupted_keyframe() -> None:
+    """6DoF tracker must not corrupt _mesh_keyframes when input degrades to LOST/AMBIGUOUS."""
+    img = np.full((360, 480, 3), (40, 40, 40), dtype=np.uint8)
+    img[90:270, 190:290] = (170, 130, 70)
+    rng = np.random.default_rng(9)
+    for _ in range(30):
+        x, y = int(rng.integers(198, 276)), int(rng.integers(98, 256))
+        cv2.rectangle(img, (x, y), (x + 10, y + 10), (int(rng.integers(20, 240)), 60, 200), -1)
+    sel = SelectionSpec(frame_index=0, positive_points=[(240.0, 180.0)], bbox=(188.0, 88.0, 104.0, 184.0))
+    seg = segment_frame(img, sel, sharp_onboarding=True)
+    tracker = VideoSurfaceTracker(
+        wrap_mode="mesh_6dof",
+        mesh=build_parametric_mesh("cylinder"),
+        intrinsics=(500.0, 500.0, 240.0, 180.0),
+    )
+    r0 = tracker.initialize(img, seg)
+    assert r0.state == "tracking"
+    kf_init = len(tracker._mesh_keyframes)
+    assert kf_init >= 1
+
+    blank = np.zeros_like(img)
+    r1 = tracker.track_frame(blank, 1, 0.033)
+    assert r1.state == "lost"
+    assert r1.confidence_state == "LOST"
+    assert len(tracker._mesh_keyframes) == kf_init
+

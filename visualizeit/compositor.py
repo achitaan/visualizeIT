@@ -120,6 +120,81 @@ def _guided_filter_alpha(
     return np.clip(mean_a * I_full + mean_b, 0.0, 1.0)
 
 
+def _guided_filter_rgb_alpha(
+    guide_bgr_u8: np.ndarray,
+    mask_f32: np.ndarray,
+    *,
+    radius: int = 3,
+    eps: float = 0.003,
+) -> np.ndarray:
+    """Fast O(1) 3-channel RGB Guided Filter (He et al. 2013) snapping soft masks to luminance AND chroma edges."""
+    if guide_bgr_u8.ndim != 3 or guide_bgr_u8.shape[2] != 3:
+        return _guided_filter_alpha(guide_bgr_u8, mask_f32, radius=radius, eps=eps)
+    h, w = guide_bgr_u8.shape[:2]
+    I_full = guide_bgr_u8.astype(np.float32) * (1.0 / 255.0)
+    if h >= 64 and w >= 64:
+        sh, sw = max(24, h // 2), max(24, w // 2)
+        I = cv2.resize(I_full, (sw, sh), interpolation=cv2.INTER_AREA)
+        p = cv2.resize(mask_f32.astype(np.float32), (sw, sh), interpolation=cv2.INTER_AREA)
+        r_s = max(1, radius // 2)
+        upsample = True
+    else:
+        I = I_full
+        p = mask_f32.astype(np.float32)
+        r_s = max(1, radius)
+        upsample = False
+
+    k = (2 * r_s + 1, 2 * r_s + 1)
+    Ib, Ig, Ir = I[:, :, 0], I[:, :, 1], I[:, :, 2]
+    mb = cv2.boxFilter(Ib, cv2.CV_32F, k)
+    mg = cv2.boxFilter(Ig, cv2.CV_32F, k)
+    mr = cv2.boxFilter(Ir, cv2.CV_32F, k)
+    mp = cv2.boxFilter(p, cv2.CV_32F, k)
+
+    cov_bp = cv2.boxFilter(Ib * p, cv2.CV_32F, k) - mb * mp
+    cov_gp = cv2.boxFilter(Ig * p, cv2.CV_32F, k) - mg * mp
+    cov_rp = cv2.boxFilter(Ir * p, cv2.CV_32F, k) - mr * mp
+
+    var_bb = cv2.boxFilter(Ib * Ib, cv2.CV_32F, k) - mb * mb + eps
+    var_bg = cv2.boxFilter(Ib * Ig, cv2.CV_32F, k) - mb * mg
+    var_br = cv2.boxFilter(Ib * Ir, cv2.CV_32F, k) - mb * mr
+    var_gg = cv2.boxFilter(Ig * Ig, cv2.CV_32F, k) - mg * mg + eps
+    var_gr = cv2.boxFilter(Ig * Ir, cv2.CV_32F, k) - mg * mr
+    var_rr = cv2.boxFilter(Ir * Ir, cv2.CV_32F, k) - mr * mr + eps
+
+    # Closed-form symmetric 3x3 inverse: inv(Sigma + eps*I) @ cov_Ip
+    c00 = var_gg * var_rr - var_gr * var_gr
+    c01 = var_br * var_gr - var_bg * var_rr
+    c02 = var_bg * var_gr - var_gg * var_br
+    c11 = var_bb * var_rr - var_br * var_br
+    c12 = var_bg * var_br - var_bb * var_gr
+    c22 = var_bb * var_gg - var_bg * var_bg
+    det = np.maximum(var_bb * c00 + var_bg * c01 + var_br * c02, 1e-8)
+    inv_det = 1.0 / det
+
+    ab = (c00 * cov_bp + c01 * cov_gp + c02 * cov_rp) * inv_det
+    ag = (c01 * cov_bp + c11 * cov_gp + c12 * cov_rp) * inv_det
+    ar = (c02 * cov_bp + c12 * cov_gp + c22 * cov_rp) * inv_det
+    b = mp - ab * mb - ag * mg - ar * mr
+
+    mab = cv2.boxFilter(ab, cv2.CV_32F, k)
+    mag = cv2.boxFilter(ag, cv2.CV_32F, k)
+    mar = cv2.boxFilter(ar, cv2.CV_32F, k)
+    mb_out = cv2.boxFilter(b, cv2.CV_32F, k)
+
+    if upsample:
+        mab = cv2.resize(mab, (w, h), interpolation=cv2.INTER_LINEAR)
+        mag = cv2.resize(mag, (w, h), interpolation=cv2.INTER_LINEAR)
+        mar = cv2.resize(mar, (w, h), interpolation=cv2.INTER_LINEAR)
+        mb_out = cv2.resize(mb_out, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    return np.clip(
+        mab * I_full[:, :, 0] + mag * I_full[:, :, 1] + mar * I_full[:, :, 2] + mb_out,
+        0.0,
+        1.0,
+    )
+
+
 def _compute_oriented_cylinder_frame(
     ref_mask: np.ndarray | None,
     ref_bbox: tuple[int, int, int, int],
@@ -327,6 +402,14 @@ class SurfaceCompositor:
                 self._init_6dof_occlusion_reference(ref_frame_bgr, ref_mask=ref_mask, init_pose=init_pose)
 
         self._mono_bright_fg_L_lo: float | None = None
+        self._ref_frame_bgr_planar: np.ndarray | None = (
+            np.ascontiguousarray(ref_frame_bgr.copy(), dtype=np.uint8)
+            if (ref_frame_bgr is not None and placement.wrap_mode == "planar")
+            else None
+        )
+        self._vos_is_color: bool = False
+        self._vos_target_lab_lut: np.ndarray | None = None
+        self._vos_ref_skin_frac: float = 0.0
         if ref_frame_bgr is not None and ref_mask is not None and int(np.count_nonzero(ref_mask)) >= 200:
             b0, g0, r0 = ref_frame_bgr[::4, ::4, 0], ref_frame_bgr[::4, ::4, 1], ref_frame_bgr[::4, ::4, 2]
             chroma0 = float(np.mean(np.abs(r0.astype(np.int16) - g0.astype(np.int16)) + np.abs(g0.astype(np.int16) - b0.astype(np.int16))))
@@ -337,6 +420,32 @@ class SurfaceCompositor:
                     p15, p50 = np.percentile(fg_vals, [15.0, 50.0])
                     if float(p50) >= 158.0:
                         self._mono_bright_fg_L_lo = max(96.0, min(float(p15) + 2.0, float(p50) - 44.0))
+            else:
+                self._vos_is_color = True
+                if self._occ_6dof_target_lab_lut is not None:
+                    self._vos_target_lab_lut = self._occ_6dof_target_lab_lut
+                    self._vos_ref_skin_frac = self._occ_6dof_ref_skin_frac
+                else:
+                    ref_lab_u8 = cv2.cvtColor(ref_frame_bgr, cv2.COLOR_BGR2LAB)
+                    m_bool = ref_mask > 127
+                    pts_lab = ref_lab_u8[m_bool]
+                    counts = np.zeros((12, 27, 27), dtype=np.int32)
+                    np.add.at(
+                        counts,
+                        (
+                            np.clip(pts_lab[:, 0] // 24, 0, 11),
+                            np.clip(pts_lab[:, 1] // 10, 0, 26),
+                            np.clip(pts_lab[:, 2] // 10, 0, 26),
+                        ),
+                        1,
+                    )
+                    lut = counts >= max(20, int(0.015 * len(pts_lab)))
+                    lut_d = lut.copy()
+                    lut_d[1:, :, :] |= lut[:-1, :, :]
+                    lut_d[:-1, :, :] |= lut[1:, :, :]
+                    self._vos_target_lab_lut = lut_d
+                    ref_skin0 = _skin_prob_bgr(ref_frame_bgr)
+                    self._vos_ref_skin_frac = float(np.mean(ref_skin0[m_bool] > 0.45))
 
         # Reusable scratch buffers (allocated lazily on first frame)
         self._buf_shape: tuple[int, int] | None = None
@@ -1292,6 +1401,227 @@ class SurfaceCompositor:
         proj[:, 2] = np.maximum(proj[:, 2], 1e-3)
         return np.ascontiguousarray(proj, dtype=np.float32)
 
+    def _refine_vos_color_boundary(
+        self,
+        roi_bgr: np.ndarray,
+        vos_roi: np.ndarray,
+    ) -> np.ndarray:
+        """Full-res exterior-background & thin-hole rejection in a boundary band around VOS mask.
+
+        Carves out low-res EdgeTAM decoder halos/wings matching the live exterior background
+        (e.g. black tray wings, carpet halos, brown chair inside blue pitcher handle hole)
+        and high-confidence gripping skin without touching valid target/backside colors.
+        """
+        if not self._vos_is_color or self._vos_target_lab_lut is None:
+            return vos_roi
+        fg_b = vos_roi > 127
+        n_fg = int(np.count_nonzero(fg_b))
+        if n_fg < 128:
+            return vos_roi
+
+        fg_u8 = fg_b.astype(np.uint8) * 255
+        ext_ring = (
+            cv2.dilate(fg_u8, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19))) > 0
+        ) & (
+            cv2.dilate(fg_u8, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))) == 0
+        )
+        if int(np.count_nonzero(ext_ring)) < 32:
+            return vos_roi
+
+        lab_u8 = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2LAB)
+        li = np.clip(lab_u8[:, :, 0] // 24, 0, 11)
+        ai = np.clip(lab_u8[:, :, 1] // 10, 0, 26)
+        bi = np.clip(lab_u8[:, :, 2] // 10, 0, 26)
+        in_target = self._vos_target_lab_lut[li, ai, bi]
+
+        bg_pts = lab_u8[ext_ring]
+        bg_cnt = np.zeros((12, 27, 27), dtype=np.int32)
+        np.add.at(
+            bg_cnt,
+            (
+                np.clip(bg_pts[:, 0] // 24, 0, 11),
+                np.clip(bg_pts[:, 1] // 10, 0, 26),
+                np.clip(bg_pts[:, 2] // 10, 0, 26),
+            ),
+            1,
+        )
+        bg_lut = bg_cnt >= max(6, int(0.015 * len(bg_pts)))
+        bg_lut_d = bg_lut.copy()
+        bg_lut_d[1:, :, :] |= bg_lut[:-1, :, :]
+        bg_lut_d[:-1, :, :] |= bg_lut[1:, :, :]
+        in_bg = bg_lut_d[li, ai, bi]
+
+        # Restrict rejection to a ~17px boundary & thin-structure band (covers halos, wings, and thin handle holes)
+        inner_core = cv2.erode(fg_u8, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35))) > 0
+        band = fg_b & (~inner_core)
+        bg_cand = band & in_bg & (~in_target)
+        leak_cand = bg_cand
+        if self._vos_ref_skin_frac < 0.08:
+            skin_p = _skin_prob_bgr(roi_bgr)
+            leak_cand = leak_cand | (band & (skin_p > 0.55) & (~in_target))
+
+        if not np.any(leak_cand):
+            return vos_roi
+
+        touch_ext = cv2.dilate((~fg_b).astype(np.uint8) * 255, np.ones((3, 3), np.uint8)) > 0
+        n_cc, lbls, stats, _ = cv2.connectedComponentsWithStats(leak_cand.astype(np.uint8), connectivity=4)
+        if n_cc <= 1:
+            return vos_roi
+
+        flat = lbls.ravel()
+        ext_hits = np.bincount(flat, weights=touch_ext.ravel().astype(np.float32), minlength=n_cc)
+        bg_hits = np.bincount(flat, weights=bg_cand.ravel().astype(np.float32), minlength=n_cc)
+        carve = np.zeros(n_cc, dtype=bool)
+        max_hole_a = max(48, int(0.08 * n_fg))
+        for cid in range(1, n_cc):
+            area = int(stats[cid, cv2.CC_STAT_AREA])
+            if ext_hits[cid] >= 2 and area >= 8:
+                carve[cid] = True
+            elif area >= 12 and area <= max_hole_a and bg_hits[cid] >= 0.75 * float(area):
+                # Enclosed background-colored pocket inside a thin handle loop (e.g. pitcher handle hole)
+                carve[cid] = True
+
+        if not np.any(carve):
+            return vos_roi
+        out = vos_roi.copy()
+        out[carve[lbls]] = 0
+        return out
+
+    def _compute_fullres_planar_vos_alpha(
+        self,
+        roi_bgr: np.ndarray,
+        H: np.ndarray,
+        x0: int,
+        y0: int,
+        out_mask_roi: np.ndarray,
+        vos_roi: np.ndarray,
+    ) -> np.ndarray | None:
+        """Full-resolution ROI reference-diff + RGB-guided occlusion matte for color planar VOS surfaces."""
+        if self._ref_frame_bgr_planar is None or not self._occ_is_color:
+            return None
+        roi_h, roi_w = roi_bgr.shape[:2]
+        card_b = out_mask_roi > 0
+        if int(np.count_nonzero(card_b)) < 64:
+            return None
+
+        T_roi = np.array([[1.0, 0.0, float(-x0)], [0.0, 1.0, float(-y0)], [0.0, 0.0, 1.0]], dtype=np.float64)
+        M_ref2roi = T_roi @ H.astype(np.float64)
+        ref_w = cv2.warpPerspective(
+            self._ref_frame_bgr_planar,
+            M_ref2roi,
+            (roi_w, roi_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+
+        cur_lab = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+        ref_lab = cv2.cvtColor(ref_w, cv2.COLOR_BGR2LAB).astype(np.float32)
+        cur_L, cur_ab = cur_lab[:, :, 0], cur_lab[:, :, 1:3]
+        ref_L, ref_ab = ref_lab[:, :, 0], ref_lab[:, :, 1:3]
+
+        # Global luminance gain normalization on least-changed 50% of card pixels
+        rv = ref_L[card_b]
+        cv_ = cur_L[card_b]
+        raw_d = np.abs(cv_ - rv)
+        inl = raw_d <= max(float(np.median(raw_d)), 10.0)
+        if int(np.count_nonzero(inl)) >= 48:
+            gain = float(np.clip(float(rv[inl].mean()) / max(float(cv_[inl].mean()), 10.0), 0.65, 1.55))
+        else:
+            gain = 1.0
+        cur_L_n = np.clip(cur_L * gain, 0.0, 255.0)
+
+        # 3x3 Birchfield-Tomasi spatial envelope tolerates +/-1px homography jitter without blurring edges
+        k3 = np.ones((3, 3), np.uint8)
+        dL_env = np.maximum(0.0, np.maximum(cv2.erode(ref_L, k3) - cur_L_n, cur_L_n - cv2.dilate(ref_L, k3)))
+        dab_v = np.maximum(0.0, np.maximum(cv2.erode(ref_ab, k3) - cur_ab, cur_ab - cv2.dilate(ref_ab, k3)))
+        dab_env = np.hypot(dab_v[:, :, 0], dab_v[:, :, 1])
+
+        # Tight 5x5 full-res NCC (nearly 3x sharper than 7x7 on 96x96 canonical grid!)
+        win = (5, 5)
+        rm = cv2.boxFilter(ref_L, cv2.CV_32F, win)
+        rs = np.sqrt(np.maximum(cv2.boxFilter(ref_L * ref_L, cv2.CV_32F, win) - rm * rm, 0.0))
+        cm = cv2.boxFilter(cur_L_n, cv2.CV_32F, win)
+        cs = np.sqrt(np.maximum(cv2.boxFilter(cur_L_n * cur_L_n, cv2.CV_32F, win) - cm * cm, 0.0))
+        cov = cv2.boxFilter(ref_L * cur_L_n, cv2.CV_32F, win) - rm * cm
+        denom = rs * cs
+        has_tex = rs > 10.0
+        ncc = np.where(has_tex & (denom > 1e-3), cov / np.maximum(denom, 1e-3), 1.0)
+        tex_destroyed = (rs > 12.0) & (cs < 0.28 * rs)
+        ncc = np.where(tex_destroyed, 0.0, ncc)
+
+        skin_ex = np.maximum(0.0, _skin_prob_bgr(roi_bgr) - _skin_prob_bgr(ref_w))
+        occ_ev = (
+            (dab_env > 18.0)
+            | ((dab_env > 9.5) & (ncc < 0.45))
+            | (has_tex & (dL_env > 10.0) & (ncc < 0.42))
+            | (tex_destroyed & (dL_env > 5.0))
+            | ((~has_tex) & (dL_env > 20.0))
+            | ((skin_ex > 0.22) & ((dab_env > 5.5) | (dL_env > 6.0) | (ncc < 0.60)))
+        )
+
+        # Full-res exterior-connected smooth-occluder flood-fill (snaps cleanly to straight bar & finger edges!)
+        gL = np.hypot(cv2.Sobel(cur_L_n, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(cur_L_n, cv2.CV_32F, 0, 1, ksize=3))
+        ga = np.hypot(cv2.Sobel(cur_ab[:, :, 0], cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(cur_ab[:, :, 0], cv2.CV_32F, 0, 1, ksize=3))
+        gb = np.hypot(cv2.Sobel(cur_ab[:, :, 1], cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(cur_ab[:, :, 1], cv2.CV_32F, 0, 1, ksize=3))
+        cur_grad = np.maximum(gL, 2.5 * np.hypot(ga, gb))
+
+        strong_ref = (
+            has_tex & (ncc > 0.70) & (dL_env < 8.5) & (dab_env < 8.0) & (~tex_destroyed) & (skin_ex < 0.14)
+        )
+        smooth_changed = (~card_b) | (
+            (cur_grad < 24.0)
+            & (~strong_ref)
+            & ((dL_env > 6.5) | (dab_env > 6.5) | (has_tex & (ncc < 0.48)) | tex_destroyed | (skin_ex > 0.18) | (vos_roi <= 127))
+        )
+        n_cc, cc_lbl, _, _ = cv2.connectedComponentsWithStats(smooth_changed.astype(np.uint8), connectivity=4)
+        fg_grown = np.zeros((roi_h, roi_w), dtype=bool)
+        if n_cc > 1:
+            flat = cc_lbl.ravel()
+            ext_c = np.bincount(flat, weights=(~card_b).ravel().astype(np.float32), minlength=n_cc)
+            in_c = np.bincount(flat, weights=card_b.ravel().astype(np.float32), minlength=n_cc)
+            ev_c = np.bincount(flat, weights=(occ_ev & card_b).ravel().astype(np.float32), minlength=n_cc)
+            sk_c = np.bincount(flat, weights=((skin_ex > 0.22) & card_b).ravel().astype(np.float32), minlength=n_cc)
+            vos_out_c = np.bincount(flat, weights=((vos_roi <= 127) & card_b).ravel().astype(np.float32), minlength=n_cc)
+            keep_cc = np.zeros(n_cc, dtype=bool)
+            for cid in range(1, n_cc):
+                if ext_c[cid] >= 20 and in_c[cid] >= 32:
+                    ev_f = ev_c[cid] / max(in_c[cid], 1.0)
+                    vo_f = vos_out_c[cid] / max(in_c[cid], 1.0)
+                    if ev_f >= 0.12 or (sk_c[cid] >= 12 and ev_f >= 0.04) or (vo_f >= 0.40 and ev_f >= 0.04):
+                        keep_cc[cid] = True
+            if np.any(keep_cc):
+                fg_grown = keep_cc[cc_lbl] & card_b & (~strong_ref)
+                # Dilate 1px to catch the exact sub-pixel anti-aliased boundary of the crossing bar/hand
+                fg_grown = (cv2.dilate(fg_grown.astype(np.uint8) * 255, k3, iterations=1) > 0) & card_b & (~strong_ref)
+
+        occ_in = (occ_ev | fg_grown) & card_b & (~strong_ref)
+        # Clean tiny interior noise specks not touching the card border
+        touch_bnd = card_b & (cv2.erode(card_b.astype(np.uint8) * 255, np.ones((5, 5), np.uint8)) == 0)
+        n_oc, oc_lbl, oc_stats, _ = cv2.connectedComponentsWithStats(occ_in.astype(np.uint8), connectivity=8)
+        occ_clean = np.zeros((roi_h, roi_w), dtype=bool)
+        if n_oc > 1:
+            flat_o = oc_lbl.ravel()
+            bnd_h = np.bincount(flat_o, weights=touch_bnd.ravel().astype(np.float32), minlength=n_oc)
+            keep_o = np.zeros(n_oc, dtype=bool)
+            for cid in range(1, n_oc):
+                area = int(oc_stats[cid, cv2.CC_STAT_AREA])
+                if (bnd_h[cid] >= 2 and area >= 24) or area >= 96:
+                    keep_o[cid] = True
+            if np.any(keep_o):
+                occ_clean = keep_o[oc_lbl]
+
+        # If card is virtually unoccluded (<1.5% occluded), return razor-sharp 100% homography card alpha!
+        occ_frac = float(np.count_nonzero(occ_clean)) / float(max(int(np.count_nonzero(card_b)), 1))
+        if occ_frac < 0.015:
+            return np.where(card_b, 1.0, 0.0).astype(np.float32)
+
+        occ_u8 = np.where(occ_clean, np.uint8(255), np.uint8(0))
+        occ_u8 = cv2.morphologyEx(occ_u8, cv2.MORPH_CLOSE, k3)
+        vis_raw = np.where(card_b & (occ_u8 == 0), 1.0, 0.0).astype(np.float32)
+        vis_alpha = _guided_filter_rgb_alpha(roi_bgr, vis_raw, radius=3, eps=0.002)
+        vis_alpha = np.clip((vis_alpha - 0.18) / 0.64, 0.0, 1.0)
+        return np.where(card_b, vis_alpha, 0.0).astype(np.float32)
+
     def composite(
         self,
         frame_bgr: np.ndarray,
@@ -1448,10 +1778,6 @@ class SurfaceCompositor:
                         surface_mask_crop=None,
                     )
                 tex_rgba = self._placed_rgba_unclipped
-                # On color planar surfaces, also run fast local texture-destruction check to catch
-                # same-color foreground bars that split the card and can cause VOS bridging.
-                if mode == "planar" and self._occ_enabled and self._occ_is_color:
-                    self._apply_local_occlusion_mask(frame_bgr, H, export_ref_match=True)
             else:
                 tex_rgba = self._apply_local_occlusion_mask(frame_bgr, H) if self._occ_enabled else self._placed_rgba
 
@@ -1477,7 +1803,7 @@ class SurfaceCompositor:
             ys_m, xs_m = np.nonzero(out_mask > 0)
             if len(xs_m) < 24:
                 return frame_bgr, None, (time.perf_counter() - t0) * 1000.0
-            pad_r = 10
+            pad_r = 14
             x0 = max(0, int(xs_m.min()) - pad_r)
             y0 = max(0, int(ys_m.min()) - pad_r)
             x1 = min(w, int(xs_m.max()) + pad_r + 1)
@@ -1485,81 +1811,65 @@ class SurfaceCompositor:
             vos_roi = external_fg_mask[y0:y1, x0:x1]
             if not np.any(vos_roi > 0):
                 return frame_bgr, None, (time.perf_counter() - t0) * 1000.0
-            if mode == "cylinder":
-                # Fill strictly enclosed interior specular slits (up to 3.5% of fg area) inside solid cylinders
-                # (eliminates vertical shiny-plastic holes like ycb_s50 f=25..44 without affecting exterior cutouts!)
-                fg_r_cnt = int(np.count_nonzero(vos_roi > 127))
-                if fg_r_cnt >= 128:
-                    inv_r = ((vos_roi <= 127).astype(np.uint8)) * 255
-                    n_hr, hr_lbl, hr_stats, _ = cv2.connectedComponentsWithStats(inv_r, connectivity=4)
-                    if n_hr > 2:
-                        bnd_r = set(np.unique(hr_lbl[0, :]).tolist())
-                        bnd_r.update(np.unique(hr_lbl[-1, :]).tolist())
-                        bnd_r.update(np.unique(hr_lbl[:, 0]).tolist())
-                        bnd_r.update(np.unique(hr_lbl[:, -1]).tolist())
-                        max_slit = max(32, int(0.035 * fg_r_cnt))
-                        filled_r = vos_roi.copy()
-                        changed_r = False
-                        for hl in range(1, n_hr):
-                            if hl not in bnd_r and int(hr_stats[hl, cv2.CC_STAT_AREA]) <= max_slit:
-                                filled_r[hr_lbl == hl] = 255
-                                changed_r = True
-                        if changed_r:
-                            vos_roi = filled_r
-            roi_gray = cv2.cvtColor(frame_bgr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
-            vos_alpha = _guided_filter_alpha(
-                roi_gray,
-                vos_roi.astype(np.float32) * (1.0 / 255.0),
-                radius=2,
-                eps=0.004,
-            )
-            vos_alpha = np.clip((vos_alpha - 0.16) / 0.68, 0.0, 1.0)
+            roi_bgr = frame_bgr[y0:y1, x0:x1]
+            roi_gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+
+            planar_alpha: np.ndarray | None = None
             if (
                 mode == "planar"
+                and self._ref_frame_bgr_planar is not None
                 and self._occ_is_color
-                and self._last_2d_H_crop2img is not None
+                and track_result.homography_3x3 is not None
             ):
-                roi_w, roi_h = x1 - x0, y1 - y0
-                T_roi = np.array([[1.0, 0.0, float(-x0)], [0.0, 1.0, float(-y0)], [0.0, 0.0, 1.0]], dtype=np.float64)
-                H_to_roi = T_roi @ self._last_2d_H_crop2img
-                # Restore strictly unoccluded reference-matching planar pixels (recovers inter-finger gaps & split islands!)
-                if self._last_2d_ref_match_u8 is not None:
-                    ref_roi_u8 = cv2.warpPerspective(
-                        self._last_2d_ref_match_u8,
-                        H_to_roi,
-                        (roi_w, roi_h),
-                        flags=cv2.INTER_LINEAR,
-                        borderMode=cv2.BORDER_CONSTANT,
-                        borderValue=0,
+                planar_alpha = self._compute_fullres_planar_vos_alpha(
+                    roi_bgr,
+                    track_result.homography_3x3,
+                    x0,
+                    y0,
+                    out_mask[y0:y1, x0:x1],
+                    vos_roi,
+                )
+
+            if planar_alpha is not None:
+                vos_alpha = planar_alpha
+            else:
+                if mode == "cylinder":
+                    # Fill strictly enclosed interior specular slits (up to 3.5% of fg area) inside solid cylinders
+                    # (eliminates vertical shiny-plastic holes like ycb_s50 f=25..44 without affecting exterior cutouts!)
+                    fg_r_cnt = int(np.count_nonzero(vos_roi > 127))
+                    if fg_r_cnt >= 128:
+                        inv_r = ((vos_roi <= 127).astype(np.uint8)) * 255
+                        n_hr, hr_lbl, hr_stats, _ = cv2.connectedComponentsWithStats(inv_r, connectivity=4)
+                        if n_hr > 2:
+                            bnd_r = set(np.unique(hr_lbl[0, :]).tolist())
+                            bnd_r.update(np.unique(hr_lbl[-1, :]).tolist())
+                            bnd_r.update(np.unique(hr_lbl[:, 0]).tolist())
+                            bnd_r.update(np.unique(hr_lbl[:, -1]).tolist())
+                            max_slit = max(32, int(0.035 * fg_r_cnt))
+                            filled_r = vos_roi.copy()
+                            changed_r = False
+                            for hl in range(1, n_hr):
+                                if hl not in bnd_r and int(hr_stats[hl, cv2.CC_STAT_AREA]) <= max_slit:
+                                    filled_r[hr_lbl == hl] = 255
+                                    changed_r = True
+                            if changed_r:
+                                vos_roi = filled_r
+                if self._vos_is_color and mode in ("mesh_6dof", "cylinder"):
+                    vos_roi = self._refine_vos_color_boundary(roi_bgr, vos_roi)
+                    vos_alpha = _guided_filter_rgb_alpha(
+                        roi_bgr,
+                        vos_roi.astype(np.float32) * (1.0 / 255.0),
+                        radius=2,
+                        eps=0.003,
                     )
-                    if np.any(ref_roi_u8 > 127):
-                        ref_alpha = _guided_filter_alpha(
-                            roi_gray,
-                            ref_roi_u8.astype(np.float32) * (1.0 / 255.0),
-                            radius=2,
-                            eps=0.004,
-                        )
-                        ref_alpha = np.clip((ref_alpha - 0.25) / 0.55, 0.0, 1.0)
-                        vos_alpha = np.maximum(vos_alpha, ref_alpha)
-                # Subtract local reference-diff occluders (cleanly cuts out same-color crossing bars!)
-                if self._last_2d_occ_u8 is not None:
-                    occ_roi_u8 = cv2.warpPerspective(
-                        self._last_2d_occ_u8,
-                        H_to_roi,
-                        (roi_w, roi_h),
-                        flags=cv2.INTER_LINEAR,
-                        borderMode=cv2.BORDER_REPLICATE,
-                        borderValue=0,
+                else:
+                    vos_alpha = _guided_filter_alpha(
+                        roi_gray,
+                        vos_roi.astype(np.float32) * (1.0 / 255.0),
+                        radius=2,
+                        eps=0.004,
                     )
-                    if np.any(occ_roi_u8 > 16):
-                        occ_alpha = _guided_filter_alpha(
-                            roi_gray,
-                            occ_roi_u8.astype(np.float32) * (1.0 / 255.0),
-                            radius=2,
-                            eps=0.004,
-                        )
-                        occ_alpha = np.clip((occ_alpha - 0.16) / 0.68, 0.0, 1.0)
-                        vos_alpha = vos_alpha * (1.0 - occ_alpha)
+                vos_alpha = np.clip((vos_alpha - 0.16) / 0.68, 0.0, 1.0)
             if self._mono_bright_fg_L_lo is not None and mode in ("cylinder", "mesh_6dof"):
                 # On bright uniform monochrome objects (e.g. white plastic bottle/mug), carve out
                 # exterior-connected darker fingers/thumbs crossing the front surface.

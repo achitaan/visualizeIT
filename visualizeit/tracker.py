@@ -1122,6 +1122,148 @@ class VideoSurfaceTracker:
 
         return best_t, best_iou, best_cov, None, best_rmse
 
+    def _refine_6dof_cylinder_rot_to_vos(
+        self,
+        rvec: np.ndarray,
+        tvec: np.ndarray,
+        vos_iou: float,
+        vos_cov: float,
+        vos_mask: np.ndarray,
+        pts3d_inl: np.ndarray,
+        pts2d_native_inl: np.ndarray,
+        base_rmse: float,
+        res_scale: float,
+        *,
+        coasting: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray, float, float, float]:
+        """Fast (~2ms) 5-DoF silhouette-contour roll+pitch+translation alignment for parametric cylinders.
+
+        Preserves cylinder spin yaw while snapping drifted in-plane roll and out-of-plane pitch
+        (e.g. featureless backside pitch collapse on bottles or tilted soup cans) directly to the
+        live VOS foreground silhouette.
+        """
+        assert self._K is not None
+        if (
+            self.mesh is None
+            or self.mesh.source_kind != "parametric"
+            or self.mesh.name != "cylinder"
+            or vos_iou >= 0.86
+        ):
+            return rvec, tvec, vos_iou, vos_cov, base_rmse
+
+        cur_f = _extract_oriented_mask_frame(vos_mask)
+        if cur_f is None:
+            return rvec, tvec, vos_iou, vos_cov, base_rmse
+        vcx, vcy, vw, vh, v_roll = cur_f
+
+        scale = min(1.0, 320.0 / float(max(self._frame_w, self._frame_h, 1)))
+        if scale < 0.99:
+            sw = max(32, int(round(self._frame_w * scale)))
+            sh = max(24, int(round(self._frame_h * scale)))
+            vos_s = cv2.resize(vos_mask, (sw, sh), interpolation=cv2.INTER_NEAREST) > 127
+        else:
+            vos_s = vos_mask > 127
+        ys_v, xs_v = np.nonzero(vos_s)
+        if len(xs_v) < 16:
+            return rvec, tvec, vos_iou, vos_cov, base_rmse
+
+        inv_s = 1.0 / max(scale, 1e-4)
+        vx0 = float(np.percentile(xs_v, 1.0)) * inv_s
+        vx1 = float(np.percentile(xs_v, 99.0)) * inv_s
+        vy0 = float(np.percentile(ys_v, 1.0)) * inv_s
+        vy1 = float(np.percentile(ys_v, 99.0)) * inv_s
+        v_bbox_cx = 0.5 * (vx0 + vx1)
+        v_bbox_cy = 0.5 * (vy0 + vy1)
+        v_bbox_w = max(8.0, vx1 - vx0)
+        v_bbox_h = max(8.0, vy1 - vy0)
+        n_vos_nat = float(len(xs_v)) * (inv_s * inv_s)
+        allow_scale = (self._init_vos_area > 0.0) and (n_vos_nat >= 0.65 * self._init_vos_area)
+        fx, fy = float(self._K[0, 0]), float(self._K[1, 1])
+
+        def _align_t_and_eval(r_cand: np.ndarray, t_seed: np.ndarray) -> tuple[np.ndarray, float, float]:
+            ci, cc, pbbox = self._eval_6dof_vos_iou_fast(r_cand, t_seed, vos_s, scale)
+            if pbbox is None:
+                return t_seed, ci, cc
+            px0, py0, px1, py1 = pbbox
+            pcx = 0.5 * (px0 + px1)
+            pcy = 0.5 * (py0 + py1)
+            pw = max(8.0, px1 - px0)
+            ph = max(8.0, py1 - py0)
+            tz_old = float(t_seed[2])
+            sr = float(np.clip(max(v_bbox_w / pw, v_bbox_h / ph), 0.78, 1.28)) if allow_scale else 1.0
+            tz_new = float(np.clip(tz_old / max(sr, 0.5), max(0.06, 0.55 * self._init_tz), 1.65 * self._init_tz))
+            t_new = t_seed.copy()
+            t_new[0] = (t_seed[0] + (v_bbox_cx - pcx) * tz_old / fx) * (tz_new / tz_old)
+            t_new[1] = (t_seed[1] + (v_bbox_cy - pcy) * tz_old / fy) * (tz_new / tz_old)
+            t_new[2] = tz_new
+            ci2, cc2, _ = self._eval_6dof_vos_iou_fast(r_cand, t_new, vos_s, scale)
+            if ci2 >= ci:
+                return t_new, ci2, cc2
+            return t_seed, ci, cc
+
+        best_r = rvec.copy()
+        best_t = tvec.copy()
+        best_iou = vos_iou
+        best_cov = vos_cov
+        best_rmse = base_rmse
+
+        R_cur, _ = cv2.Rodrigues(best_r.astype(np.float64))
+        proj_roll = math.atan2(-float(R_cur[0, 1]), float(R_cur[1, 1]))
+        best_v_roll = v_roll
+        best_d = abs(v_roll - proj_roll)
+        for cand_a in (v_roll + math.pi, v_roll - math.pi):
+            if abs(cand_a - proj_roll) < best_d:
+                best_d = abs(cand_a - proj_roll)
+                best_v_roll = cand_a
+
+        candidates: list[np.ndarray] = []
+        # 1) Direct in-plane roll alignment to live VOS principal axis
+        if (vh / max(vw, 1.0)) >= 1.18 and abs(best_v_roll - proj_roll) >= math.radians(2.0):
+            d_roll = float(np.clip(best_v_roll - proj_roll, -math.radians(22.0), math.radians(22.0)))
+            R_dz, _ = cv2.Rodrigues(np.array([0.0, 0.0, d_roll], dtype=np.float64))
+            r_roll, _ = cv2.Rodrigues(R_dz @ R_cur)
+            candidates.append(r_roll.ravel())
+
+        # 2) Pitch foreshortening alignment (recovers from backside pitch collapse or tracks forward tilts)
+        if best_iou < 0.84:
+            # Upright zero-pitch candidate preserving yaw and live VOS roll when silhouette is clearly upright
+            if (vh / max(vw, 1.0)) >= 1.38:
+                yaw_cur = math.atan2(float(R_cur[0, 2]), float(R_cur[2, 2]))
+                R_y, _ = cv2.Rodrigues(np.array([0.0, yaw_cur, 0.0], dtype=np.float64))
+                R_z, _ = cv2.Rodrigues(np.array([0.0, 0.0, best_v_roll], dtype=np.float64))
+                r_up, _ = cv2.Rodrigues(R_z @ R_y)
+                candidates.append(r_up.ravel())
+            R_base = R_cur
+            if candidates:
+                # Also search pitch around roll-aligned base
+                R_base, _ = cv2.Rodrigues(candidates[0].astype(np.float64))
+            for dp_deg in (-16.0, -8.0, 8.0, 16.0):
+                R_dx, _ = cv2.Rodrigues(np.array([math.radians(dp_deg), 0.0, 0.0], dtype=np.float64))
+                r_p, _ = cv2.Rodrigues(R_dx @ R_base)
+                candidates.append(r_p.ravel())
+
+        for r_cand in candidates:
+            t_cand, c_iou, c_cov = _align_t_and_eval(r_cand, best_t)
+            if c_iou <= best_iou + 0.022:
+                continue
+            # Check KLT RMSE when tracking strongly; allow pure silhouette ICP when pose visibly diverged (vos_iou < 0.76)
+            if (not coasting) and len(pts3d_inl) >= 8:
+                proj_c, _ = cv2.projectPoints(pts3d_inl, r_cand, t_cand, self._K, None)
+                errs = np.linalg.norm(proj_c.reshape(-1, 2) - pts2d_native_inl, axis=1)
+                rmse_c = float(math.sqrt(float(np.mean(errs ** 2))))
+                rmse_lim = max(base_rmse + 3.5 * res_scale, 7.5 * res_scale)
+                if rmse_c > rmse_lim and not (vos_iou < 0.78 and c_iou >= vos_iou + 0.06):
+                    continue
+            else:
+                rmse_c = base_rmse
+            best_r = r_cand.copy()
+            best_t = t_cand.copy()
+            best_iou = c_iou
+            best_cov = c_cov
+            best_rmse = rmse_c
+
+        return best_r, best_t, best_iou, best_cov, best_rmse
+
     def _estimate_cylinder_similarity_from_vos(self, vos_mask: np.ndarray) -> np.ndarray | None:
         """Compute a smooth 4-DoF similarity homography from frame-0 VOS frame to current VOS mask."""
         if self._init_vos_frame is None:
@@ -3097,6 +3239,18 @@ class VideoSurfaceTracker:
                         )
                         if vos_iou >= pre_iou + 0.05:
                             vos_snapped_6dof = True
+                        if vos_iou < 0.80:
+                            try:
+                                rv2, tv2, i2, c2, r2 = self._refine_6dof_cylinder_rot_to_vos(
+                                    rvec, tvec, vos_iou, vos_cov, external_fg_mask,
+                                    inl_pts3d, inl_native, rmse, res_scale, coasting=False,
+                                )
+                                if i2 >= vos_iou + 0.03:
+                                    rvec, tvec, vos_iou, vos_cov, rmse = rv2, tv2, i2, c2, r2
+                                    _, _, depth_buf = self._eval_6dof_vos_iou(rvec, tvec, external_fg_mask)
+                                    vos_snapped_6dof = True
+                            except Exception:
+                                pass
                     edge_sup = vos_iou
                     bg_empty_frac = max(0.0, 1.0 - vos_iou)
                     bg_mask_img = None

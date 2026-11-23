@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>visualizeIT Studio — Real-Time Causal Surface Design Engine</title>
+  <meta
+    name="description"
+    content="Interactive surface design studio for mapping procedural and custom RGBA artwork onto recorded video and live camera objects with causal tracking, surface wrapping, occlusion handling, and H.264 MP4 export."
+  />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar" role="banner">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true"></div>
+      <div class="brand-copy">
+        <h1>visualizeIT Studio</h1>
+        <span class="brand-sub">Causal Surface Tracking &amp; Rendering Workbench</span>
+      </div>
+    </div>
+
+    <nav class="mode-switch" aria-label="Workspace mode">
+      <button
+        id="mode-video-btn"
+        type="button"
+        class="mode-btn is-active"
+        data-testid="mode-video"
+        aria-pressed="true"
+      >
+        Recorded Video
+      </button>
+      <button
+        id="mode-camera-btn"
+        type="button"
+        class="mode-btn"
+        data-testid="mode-camera"
+        aria-pressed="false"
+      >
+        Live Camera
+      </button>
+    </nav>
+
+    <div class="telemetry-strip" aria-label="Live performance telemetry">
+      <div class="metric-cell">
+        <span class="metric-label">FPS</span>
+        <span class="metric-val" id="hud-fps" data-testid="hud-fps">0.0</span>
+      </div>
+      <div class="metric-cell">
+        <span class="metric-label">Latency</span>
+        <span class="metric-val" id="hud-latency-ms" data-testid="hud-latency-ms">0.0 ms</span>
+      </div>
+      <div class="metric-cell">
+        <span class="metric-label">State</span>
+        <span class="metric-val state-idle" id="hud-tracking-state" data-testid="hud-tracking-state">idle</span>
+      </div>
+      <div class="metric-cell">
+        <span class="metric-label">Frames</span>
+        <span class="metric-val" id="hud-processed-frames" data-testid="hud-processed-frames">0</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <section class="stage-column" aria-label="Interactive video and camera viewport">
+      <div class="stage-toolbar">
+        <div class="toolbar-group">
+          <button
+            id="play-pause-btn"
+            type="button"
+            class="btn btn-primary"
+            data-testid="play-pause-btn"
+          >
+            Play
+          </button>
+          <div class="segmented" role="group" aria-label="Selection tool">
+            <button
+              id="select-mode-point-btn"
+              type="button"
+              class="seg-btn is-active"
+              data-testid="select-mode-point"
+              aria-pressed="true"
+            >
+              Point
+            </button>
+            <button
+              id="select-mode-box-btn"
+              type="button"
+              class="seg-btn"
+              data-testid="select-mode-box"
+              aria-pressed="false"
+            >
+              Box
+            </button>
+          </div>
+          <button
+            id="auto-select-btn"
+            type="button"
+            class="btn btn-secondary"
+            data-testid="auto-select-btn"
+          >
+            Auto Select
+          </button>
+          <button
+            id="clear-selection-btn"
+            type="button"
+            class="btn btn-ghost"
+            data-testid="clear-selection-btn"
+          >
+            Clear
+          </button>
+        </div>
+
+        <div class="toolbar-group export-group">
+          <button
+            id="export-mp4-btn"
+            type="button"
+            class="btn btn-accent"
+            data-testid="export-mp4-btn"
+          >
+            Export MP4
+          </button>
+          <a
+            id="export-download-link"
+            class="btn btn-download is-disabled"
+            data-testid="export-download-link"
+            href="#"
+            aria-disabled="true"
+          >
+            Download MP4
+          </a>
+        </div>
+      </div>
+
+      <div class="stage-frame" id="stage-frame">
+        <canvas
+          id="stage-canvas"
+          width="640"
+          height="480"
+          data-testid="stage-canvas"
+          aria-label="Surface tracking stage canvas"
+        ></canvas>
+        <div class="stage-hint" id="stage-status" role="status" aria-live="polite">
+          Load a demo clip, upload a video, or switch to Live Camera. Click or drag on the stage to anchor artwork.
+        </div>
+      </div>
+
+      <video
+        id="source-video"
+        class="sr-media"
+        playsinline
+        muted
+        loop
+        crossorigin="anonymous"
+      ></video>
+      <video
+        id="camera-video"
+        class="sr-media"
+        playsinline
+        muted
+        autoplay
+      ></video>
+    </section>
+
+    <aside class="inspector-column" aria-label="Source, artwork, and surface controls">
+      <section class="panel" aria-labelledby="heading-source">
+        <h2 id="heading-source">Source Media</h2>
+        <div class="control-row">
+          <label for="demo-clip-select">Demo Clip</label>
+          <div class="inline-pair">
+            <select id="demo-clip-select" data-testid="demo-clip-select">
+              <option value="planar_card_640x480">planar_card_640x480</option>
+              <option value="planar_hd_1280x720">planar_hd_1280x720</option>
+              <option value="cylinder_mug_640x480">cylinder_mug_640x480</option>
+              <option value="occlusion_recovery_640x480">occlusion_recovery_640x480</option>
+              <option value="mesh_box_640x480">mesh_box_640x480</option>
+            </select>
+            <button
+              id="load-demo-btn"
+              type="button"
+              class="btn btn-secondary"
+              data-testid="load-demo-btn"
+            >
+              Load
+            </button>
+          </div>
+        </div>
+
+        <div class="control-row">
+          <label for="video-file-input">Upload Recorded Video (.mp4, .webm, .mov)</label>
+          <input
+            id="video-file-input"
+            type="file"
+            accept="video/*,.mp4,.webm,.mov,.avi"
+            data-testid="video-file-input"
+          />
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="heading-design">
+        <h2 id="heading-design">Artwork &amp; Prompt</h2>
+        <div class="design-preview-wrap">
+          <canvas id="design-preview-canvas" width="160" height="160" aria-label="Active artwork preview"></canvas>
+          <div class="design-meta">
+            <div class="control-row">
+              <label for="pattern-select">Procedural Pattern</label>
+              <select id="pattern-select" data-testid="pattern-select">
+                <option value="stripes">stripes</option>
+                <option value="checker">checker</option>
+                <option value="dots">dots</option>
+                <option value="waves">waves</option>
+                <option value="grid">grid</option>
+                <option value="solid">solid</option>
+              </select>
+            </div>
+            <div class="control-row">
+              <label for="design-image-input">Custom RGBA Artwork</label>
+              <input
+                id="design-image-input"
+                type="file"
+                accept="image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp"
+                data-testid="design-image-input"
+              />
+            </div>
+          </div>
+        </div>
+
+        <div class="control-row">
+          <label for="design-prompt-input">Design Prompt</label>
+          <div class="inline-pair">
+            <input
+              id="design-prompt-input"
+              type="text"
+              placeholder='e.g. crimson and gold stripes text "STUDIO"'
+              data-testid="design-prompt-input"
+            />
+            <button
+              id="apply-prompt-btn"
+              type="button"
+              class="btn btn-secondary"
+              data-testid="apply-prompt-btn"
+            >
+              Apply
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="heading-surface">
+        <h2 id="heading-surface">Surface &amp; Placement</h2>
+        <div class="two-col">
+          <div class="control-row">
+            <label for="wrap-mode-select">Wrap Mode</label>
+            <select id="wrap-mode-select" data-testid="wrap-mode-select">
+              <option value="planar">planar</option>
+              <option value="cylinder">cylinder</option>
+              <option value="mesh_grid">mesh_grid</option>
+              <option value="mesh_6dof">mesh_6dof</option>
+            </select>
+          </div>
+          <div class="control-row">
+            <label for="blend-mode-select">Blend Mode</label>
+            <select id="blend-mode-select" data-testid="blend-mode-select">
+              <option value="luminance">luminance</option>
+              <option value="normal">normal</option>
+              <option value="ink">ink</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="slider-row">
+          <div class="slider-head">
+            <label for="opacity-slider">Opacity</label>
+            <span class="slider-val" id="opacity-val">0.90</span>
+          </div>
+          <input
+            id="opacity-slider"
+            type="range"
+            min="0"
+            max="1"
+            step="0.01"
+            value="0.90"
+            data-testid="opacity-slider"
+          />
+        </div>
+
+        <div class="slider-row">
+          <div class="slider-head">
+            <label for="scale-slider">Scale</label>
+            <span class="slider-val" id="scale-val">1.00×</span>
+          </div>
+          <input
+            id="scale-slider"
+            type="range"
+            min="0.1"
+            max="5.0"
+            step="0.05"
+            value="1.0"
+            data-testid="scale-slider"
+          />
+        </div>
+
+        <div class="slider-row">
+          <div class="slider-head">
+            <label for="rotation-slider">Rotation</label>
+            <span class="slider-val" id="rotation-val">0°</span>
+          </div>
+          <input
+            id="rotation-slider"
+            type="range"
+            min="-180"
+            max="180"
+            step="1"
+            value="0"
+            data-testid="rotation-slider"
+          />
+        </div>
+      </section>
+    </aside>
+  </main>
+
+  <script src="/static/design-engine.js"></script>
+  <script src="/static/surface-renderer.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

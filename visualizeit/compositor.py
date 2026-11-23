@@ -298,6 +298,8 @@ class SurfaceCompositor:
         self._work_rgba: np.ndarray | None = None
         self._base_alpha_u8: np.ndarray | None = None
         self._last_2d_occ_u8: np.ndarray | None = None
+        self._last_2d_ref_match_u8: np.ndarray | None = None
+        self._last_2d_H_crop2img: np.ndarray | None = None
 
         # 6-DoF 3D-projected UV reference + image-space exterior hand/occluder state
         self._occ_6dof_enabled = False
@@ -323,6 +325,18 @@ class SurfaceCompositor:
                 self._init_local_occlusion_reference(ref_frame_bgr, ref_mask=mask_crop)
             else:
                 self._init_6dof_occlusion_reference(ref_frame_bgr, ref_mask=ref_mask, init_pose=init_pose)
+
+        self._mono_bright_fg_L_lo: float | None = None
+        if ref_frame_bgr is not None and ref_mask is not None and int(np.count_nonzero(ref_mask)) >= 200:
+            b0, g0, r0 = ref_frame_bgr[::4, ::4, 0], ref_frame_bgr[::4, ::4, 1], ref_frame_bgr[::4, ::4, 2]
+            chroma0 = float(np.mean(np.abs(r0.astype(np.int16) - g0.astype(np.int16)) + np.abs(g0.astype(np.int16) - b0.astype(np.int16))))
+            if chroma0 < 6.0:
+                gray0 = cv2.cvtColor(ref_frame_bgr, cv2.COLOR_BGR2GRAY)
+                fg_vals = gray0[ref_mask > 127]
+                if len(fg_vals) >= 200:
+                    p15, p50 = np.percentile(fg_vals, [15.0, 50.0])
+                    if float(p50) >= 158.0:
+                        self._mono_bright_fg_L_lo = max(96.0, min(float(p15) + 2.0, float(p50) - 44.0))
 
         # Reusable scratch buffers (allocated lazily on first frame)
         self._buf_shape: tuple[int, int] | None = None
@@ -559,7 +573,9 @@ class SurfaceCompositor:
 
         self._occ_6dof_enabled = True
 
-    def _apply_local_occlusion_mask(self, frame_bgr: np.ndarray, H: np.ndarray) -> np.ndarray:
+    def _apply_local_occlusion_mask(
+        self, frame_bgr: np.ndarray, H: np.ndarray, *, export_ref_match: bool = False
+    ) -> np.ndarray:
         """Compute multi-cue 124x124 visibility mask (ref+dense NCC, exterior-connected hand/fg seg, half-scale flow)."""
         if (
             not self._occ_enabled
@@ -653,7 +669,8 @@ class SurfaceCompositor:
             if self._occ_is_color:
                 cur_skin = _skin_prob_bgr(cur_full)
                 skin_excess = np.maximum(0.0, cur_skin - self._occ_ref_skin)
-                occ |= (skin_excess > 0.32) & ((dab_s > 8.0) | (dL_s > 8.0) | (ncc < 0.55))
+                skin_thr = 0.24 if export_ref_match else 0.32
+                occ |= (skin_excess > skin_thr) & ((dab_s > 6.5) | (dL_s > 7.0) | (ncc < 0.58))
 
             gx = cv2.Sobel(cur_L_norm, cv2.CV_32F, 1, 0, ksize=3)
             gy = cv2.Sobel(cur_L_norm, cv2.CV_32F, 0, 1, ksize=3)
@@ -676,12 +693,12 @@ class SurfaceCompositor:
             border_bridge = border_in & (cur_grad < 18.0) & ((dL_s > dl_bridge) | (dab_s > 13.0) | tex_destroyed | (ncc < 0.30))
             seed_mask[border_bridge] = 1
 
-            # Require gradient < 22.0 AND non-matching appearance (or exterior) so beige hands (f=51, dL~26, grad~15)
-            # and beige bars (f=85) flood cleanly while NEVER leaking into unoccluded matching card pixels (f=102, dL<2)!
+            # Require low gradient AND non-matching appearance (or exterior) so beige hands and bars
+            # flood cleanly while NEVER leaking into unoccluded matching card pixels (e.g. split card f=104)!
             if self.placement.wrap_mode == "cylinder":
                 smooth_changed = (~tmask) | (dL_s > 14.0) | (dab_s > 14.0) | (ncc < 0.45) | tex_destroyed
             else:
-                smooth_changed = (~tmask) | (dL_s > 4.5) | (dab_s > 4.5) | (ncc < 0.68) | tex_destroyed
+                smooth_changed = (~tmask) | (dL_s > 9.5) | (dab_s > 8.5) | (has_tex & (ncc < 0.48)) | tex_destroyed
             smooth = ((cur_grad < 22.0) & smooth_changed).astype(np.uint8)
             skin_seed = np.zeros_like(seed_mask)
             if self._occ_is_color:
@@ -705,10 +722,13 @@ class SurfaceCompositor:
                             is_fg_cc[lbl] = True
                 if np.any(is_fg_cc):
                     fg_grown = is_fg_cc[cc_labels]
+                    # Never let exterior flood-fill eat pixels that strongly match textured reference surface!
+                    strong_ref_tex = has_tex & (ncc > 0.72) & (dL_s < 9.0) & (dab_s < 8.5) & (~tex_destroyed)
+                    fg_grown = fg_grown & (~strong_ref_tex)
                     fg_grown_u8 = cv2.dilate(
                         fg_grown.astype(np.uint8) * 255, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
                     )
-                    occ |= fg_grown_u8 > 0
+                    occ |= (fg_grown_u8 > 0) & (~strong_ref_tex)
 
         # Signal 3: Fast half-scale (62x62) canonical optical flow residual
         if self.occlusion_mode in ("ref_plus_flow", "full"):
@@ -759,7 +779,8 @@ class SurfaceCompositor:
         occ_crop = occ_clean[pad:-pad, pad:-pad]
         occ_u8 = np.where(occ_crop, np.uint8(255), np.uint8(0))
         occ_u8 = cv2.morphologyEx(occ_u8, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
-        occ_u8 = cv2.morphologyEx(occ_u8, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+        close_k = (3, 3) if export_ref_match else (5, 5)
+        occ_u8 = cv2.morphologyEx(occ_u8, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, close_k))
 
         vis_cur = (255 - occ_u8).astype(np.float32)
 
@@ -774,24 +795,58 @@ class SurfaceCompositor:
         vis_u8[vis_u8 >= 190] = 255
         occ_soft_u8 = (255 - vis_u8).astype(np.uint8)
 
+        # Export textured unoccluded reference-match map only when called from neural VOS mode
+        # (zero extra work on the classical GrabCut/ORB path!)
+        if export_ref_match:
+            ref_match_tex = (
+                tmask
+                & (~occ_clean)
+                & has_tex
+                & (ncc > 0.68)
+                & (dL_s < 8.5)
+                & (dab_s < 8.0)
+                & (~tex_destroyed)
+            )
+            if self._occ_is_color and self.occlusion_mode in ("ref_plus_boundary", "full"):
+                ref_match_tex &= skin_excess < 0.14
+            # If reference-diff confirms the planar surface is unoccluded (e.g. bar/hand absent or just exited),
+            # restore 100% of the crisp homography card rectangle (immune to post-occlusion VOS memory erosion!).
+            occ_frac_card = float(np.count_nonzero(occ_clean & tmask)) / float(max(int(np.count_nonzero(tmask)), 1))
+            if occ_frac_card < 0.025 and float(np.median(dL_s[tmask])) < 6.5 and float(np.median(dab_s[tmask])) < 6.5:
+                self._last_2d_ref_match_u8 = np.full((self._occ_size, self._occ_size), 255, dtype=np.uint8)
+            else:
+                tex_dil = (
+                    cv2.dilate(ref_match_tex.astype(np.uint8) * 255, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+                    > 0
+                )
+                ref_match_full = ref_match_tex | (
+                    tex_dil & tmask & (~occ_clean) & (dL_s < 6.5) & (dab_s < 6.0) & (~tex_destroyed)
+                )
+                if self._occ_is_color and self.occlusion_mode in ("ref_plus_boundary", "full"):
+                    ref_match_full &= skin_excess < 0.14
+                ref_match_crop = ref_match_full[pad:-pad, pad:-pad]
+                self._last_2d_ref_match_u8 = np.where(ref_match_crop, np.uint8(255), np.uint8(0))
+        else:
+            self._last_2d_ref_match_u8 = None
+
         # Store native-space warp matrix and export occluder mask for tracker + guided-filter compositing
         self._last_2d_occ_u8 = occ_soft_u8 if int(np.count_nonzero(occ_soft_u8 > 16)) >= 12 else None
-        self._last_2d_H_crop2img: np.ndarray | None = None
-        if self._last_2d_occ_u8 is not None:
-            try:
-                H_c2img = H.astype(np.float64) @ np.linalg.inv(self._occ_H_ref_to_canon)
-                T_pad = np.array([[1.0, 0.0, float(pad)], [0.0, 1.0, float(pad)], [0.0, 0.0, 1.0]], dtype=np.float64)
-                H_crop2img = H_c2img @ T_pad
-                self._last_2d_H_crop2img = H_crop2img
-                if int(np.count_nonzero(occ_u8)) >= 64:
-                    fh, fw = frame_bgr.shape[:2]
-                    self.last_occluder_mask_img = cv2.warpPerspective(
-                        occ_u8, H_crop2img, (fw, fh), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0
-                    )
-            except np.linalg.LinAlgError:
-                self._last_2d_occ_u8 = None
-                self._last_2d_H_crop2img = None
-                self.last_occluder_mask_img = None
+        self._last_2d_H_crop2img = None
+        try:
+            H_c2img = H.astype(np.float64) @ np.linalg.inv(self._occ_H_ref_to_canon)
+            T_pad = np.array([[1.0, 0.0, float(pad)], [0.0, 1.0, float(pad)], [0.0, 0.0, 1.0]], dtype=np.float64)
+            H_crop2img = H_c2img @ T_pad
+            self._last_2d_H_crop2img = H_crop2img
+            if self._last_2d_occ_u8 is not None and int(np.count_nonzero(occ_u8)) >= 64:
+                fh, fw = frame_bgr.shape[:2]
+                self.last_occluder_mask_img = cv2.warpPerspective(
+                    occ_u8, H_crop2img, (fw, fh), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0
+                )
+        except np.linalg.LinAlgError:
+            self._last_2d_occ_u8 = None
+            self._last_2d_ref_match_u8 = None
+            self._last_2d_H_crop2img = None
+            self.last_occluder_mask_img = None
 
         # Return full-res clean texture for rasterization; native-space guided-filter occlusion
         # refinement is applied in composite() for crisp, non-staircased edges!
@@ -1276,6 +1331,7 @@ class SurfaceCompositor:
         mode = self.placement.wrap_mode
         self.last_occluder_mask_img = None
         self._last_2d_occ_u8 = None
+        self._last_2d_ref_match_u8 = None
         self._last_2d_H_crop2img = None
 
         if mode == "mesh_6dof":
@@ -1287,8 +1343,16 @@ class SurfaceCompositor:
                 return frame_bgr, None, (time.perf_counter() - t0) * 1000.0
             R, _ = cv2.Rodrigues(track_result.pose_rvec.astype(np.float64))
             tvec = track_result.pose_tvec.astype(np.float64).reshape(1, 3)
+            verts_local = self.mesh.vertices.astype(np.float64)
+            # In neural VOS mode, pad parametric cylinder render envelope slightly so EdgeTAM's exact
+            # pixel silhouette is the sole outer cutter (eliminates rigid blunt clipping on flared spouts/bases/limbs).
+            if use_vos and self.mesh.source_kind == "parametric" and self.mesh.name == "cylinder":
+                verts_local = verts_local.copy()
+                verts_local[:, 0] *= 1.16
+                verts_local[:, 1] *= 1.04
+                verts_local[:, 2] *= 1.16
             verts_cam = np.ascontiguousarray(
-                (self.mesh.vertices.astype(np.float64) @ R.T + tvec),
+                (verts_local @ R.T + tvec),
                 dtype=np.float32,
             )
             if self.intrinsics is not None:
@@ -1297,8 +1361,8 @@ class SurfaceCompositor:
                 f = float(max(w, h)) * 0.9
                 fx, fy, cx, cy = f, f, w * 0.5, h * 0.5
             triangles = self.mesh.triangles
-            # Backface culling for closed/curved 3D meshes: prevents inside back-wall triangles from
-            # painting across open cylinder top lids or bleeding through front occlusion holes!
+            # Backface culling for closed/curved 3D meshes: keep grazing limb triangles (-0.02)
+            # while still preventing inside back-wall triangles from bleeding across top rims/holes.
             if self.mesh.name != "plane" and len(triangles) > 0 and len(self.mesh.normals) == len(self.mesh.vertices):
                 norms_cam = self.mesh.normals.astype(np.float64) @ R.T
                 t_norms = norms_cam[triangles].mean(axis=1)
@@ -1306,7 +1370,7 @@ class SurfaceCompositor:
                 c_len = np.maximum(np.linalg.norm(t_cent, axis=1), 1e-6)
                 n_len = np.maximum(np.linalg.norm(t_norms, axis=1), 1e-6)
                 facing = np.sum(t_norms * (-t_cent), axis=1) / (c_len * n_len)
-                front_tris = triangles[facing > 0.04]
+                front_tris = triangles[facing > -0.02]
                 if len(front_tris) > 0:
                     triangles = np.ascontiguousarray(front_tris, dtype=np.int32)
             uvs = self.mesh.uvs
@@ -1334,7 +1398,13 @@ class SurfaceCompositor:
                 triangles = self._planar_tris
                 uvs = self._planar_uvs
             elif mode == "cylinder":
-                verts_cam = self._project_homography_to_cam_verts(self._cyl_ref_xy, H)
+                cyl_xy = self._cyl_ref_xy
+                if use_vos:
+                    # Pad 2D cylinder mesh slightly so live VOS silhouette is the sole outer cutter
+                    # (eliminates narrow unpainted crescents along curved bottle flanks).
+                    c_mid = cyl_xy.mean(axis=0, keepdims=True)
+                    cyl_xy = (c_mid + (cyl_xy - c_mid) * np.array([[1.08, 1.05]], dtype=np.float32)).astype(np.float32)
+                verts_cam = self._project_homography_to_cam_verts(cyl_xy, H)
                 triangles = self._cyl_tris
                 uvs = self._cyl_uvs
             elif mode == "mesh_grid":
@@ -1381,7 +1451,7 @@ class SurfaceCompositor:
                 # On color planar surfaces, also run fast local texture-destruction check to catch
                 # same-color foreground bars that split the card and can cause VOS bridging.
                 if mode == "planar" and self._occ_enabled and self._occ_is_color:
-                    self._apply_local_occlusion_mask(frame_bgr, H)
+                    self._apply_local_occlusion_mask(frame_bgr, H, export_ref_match=True)
             else:
                 tex_rgba = self._apply_local_occlusion_mask(frame_bgr, H) if self._occ_enabled else self._placed_rgba
 
@@ -1415,46 +1485,123 @@ class SurfaceCompositor:
             vos_roi = external_fg_mask[y0:y1, x0:x1]
             if not np.any(vos_roi > 0):
                 return frame_bgr, None, (time.perf_counter() - t0) * 1000.0
+            if mode == "cylinder":
+                # Fill strictly enclosed interior specular slits (up to 3.5% of fg area) inside solid cylinders
+                # (eliminates vertical shiny-plastic holes like ycb_s50 f=25..44 without affecting exterior cutouts!)
+                fg_r_cnt = int(np.count_nonzero(vos_roi > 127))
+                if fg_r_cnt >= 128:
+                    inv_r = ((vos_roi <= 127).astype(np.uint8)) * 255
+                    n_hr, hr_lbl, hr_stats, _ = cv2.connectedComponentsWithStats(inv_r, connectivity=4)
+                    if n_hr > 2:
+                        bnd_r = set(np.unique(hr_lbl[0, :]).tolist())
+                        bnd_r.update(np.unique(hr_lbl[-1, :]).tolist())
+                        bnd_r.update(np.unique(hr_lbl[:, 0]).tolist())
+                        bnd_r.update(np.unique(hr_lbl[:, -1]).tolist())
+                        max_slit = max(32, int(0.035 * fg_r_cnt))
+                        filled_r = vos_roi.copy()
+                        changed_r = False
+                        for hl in range(1, n_hr):
+                            if hl not in bnd_r and int(hr_stats[hl, cv2.CC_STAT_AREA]) <= max_slit:
+                                filled_r[hr_lbl == hl] = 255
+                                changed_r = True
+                        if changed_r:
+                            vos_roi = filled_r
             roi_gray = cv2.cvtColor(frame_bgr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
             vos_alpha = _guided_filter_alpha(
                 roi_gray,
                 vos_roi.astype(np.float32) * (1.0 / 255.0),
-                radius=3,
-                eps=0.006,
+                radius=2,
+                eps=0.004,
             )
-            vos_alpha = np.clip((vos_alpha - 0.12) / 0.76, 0.0, 1.0)
+            vos_alpha = np.clip((vos_alpha - 0.16) / 0.68, 0.0, 1.0)
             if (
                 mode == "planar"
                 and self._occ_is_color
-                and self._last_2d_occ_u8 is not None
                 and self._last_2d_H_crop2img is not None
             ):
                 roi_w, roi_h = x1 - x0, y1 - y0
                 T_roi = np.array([[1.0, 0.0, float(-x0)], [0.0, 1.0, float(-y0)], [0.0, 0.0, 1.0]], dtype=np.float64)
                 H_to_roi = T_roi @ self._last_2d_H_crop2img
-                occ_roi_u8 = cv2.warpPerspective(
-                    self._last_2d_occ_u8,
-                    H_to_roi,
-                    (roi_w, roi_h),
-                    flags=cv2.INTER_LINEAR,
-                    borderMode=cv2.BORDER_REPLICATE,
-                    borderValue=0,
-                )
-                if np.any(occ_roi_u8 > 16):
-                    occ_alpha = _guided_filter_alpha(
-                        roi_gray,
-                        occ_roi_u8.astype(np.float32) * (1.0 / 255.0),
-                        radius=4,
-                        eps=0.01,
+                # Restore strictly unoccluded reference-matching planar pixels (recovers inter-finger gaps & split islands!)
+                if self._last_2d_ref_match_u8 is not None:
+                    ref_roi_u8 = cv2.warpPerspective(
+                        self._last_2d_ref_match_u8,
+                        H_to_roi,
+                        (roi_w, roi_h),
+                        flags=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT,
+                        borderValue=0,
                     )
-                    occ_alpha = np.clip((occ_alpha - 0.16) / 0.68, 0.0, 1.0)
-                    vos_alpha = vos_alpha * (1.0 - occ_alpha)
+                    if np.any(ref_roi_u8 > 127):
+                        ref_alpha = _guided_filter_alpha(
+                            roi_gray,
+                            ref_roi_u8.astype(np.float32) * (1.0 / 255.0),
+                            radius=2,
+                            eps=0.004,
+                        )
+                        ref_alpha = np.clip((ref_alpha - 0.25) / 0.55, 0.0, 1.0)
+                        vos_alpha = np.maximum(vos_alpha, ref_alpha)
+                # Subtract local reference-diff occluders (cleanly cuts out same-color crossing bars!)
+                if self._last_2d_occ_u8 is not None:
+                    occ_roi_u8 = cv2.warpPerspective(
+                        self._last_2d_occ_u8,
+                        H_to_roi,
+                        (roi_w, roi_h),
+                        flags=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_REPLICATE,
+                        borderValue=0,
+                    )
+                    if np.any(occ_roi_u8 > 16):
+                        occ_alpha = _guided_filter_alpha(
+                            roi_gray,
+                            occ_roi_u8.astype(np.float32) * (1.0 / 255.0),
+                            radius=2,
+                            eps=0.004,
+                        )
+                        occ_alpha = np.clip((occ_alpha - 0.16) / 0.68, 0.0, 1.0)
+                        vos_alpha = vos_alpha * (1.0 - occ_alpha)
+            if self._mono_bright_fg_L_lo is not None and mode in ("cylinder", "mesh_6dof"):
+                # On bright uniform monochrome objects (e.g. white plastic bottle/mug), carve out
+                # exterior-connected darker fingers/thumbs crossing the front surface.
+                dark_cand = (roi_gray.astype(np.float32) < self._mono_bright_fg_L_lo).astype(np.uint8)
+                n_dc, dc_lbl, dc_stats, _ = cv2.connectedComponentsWithStats(dark_cand, connectivity=4)
+                if n_dc > 1:
+                    ext_vos = vos_roi <= 127
+                    flat_dc = dc_lbl.ravel()
+                    ext_hits = np.bincount(flat_dc, weights=ext_vos.ravel().astype(np.float32), minlength=n_dc)
+                    in_hits = np.bincount(flat_dc, weights=(~ext_vos).ravel().astype(np.float32), minlength=n_dc)
+                    fg_dark = np.zeros(n_dc, dtype=bool)
+                    for lbl in range(1, n_dc):
+                        if ext_hits[lbl] >= 8 and in_hits[lbl] >= 16:
+                            fg_dark[lbl] = True
+                    if np.any(fg_dark):
+                        dark_occ_f = fg_dark[dc_lbl].astype(np.float32)
+                        dark_alpha = _guided_filter_alpha(roi_gray, dark_occ_f, radius=2, eps=0.005)
+                        dark_alpha = np.clip((dark_alpha - 0.20) / 0.60, 0.0, 1.0)
+                        vos_alpha = vos_alpha * (1.0 - dark_alpha)
             a3 = vos_alpha[:, :, None]
             roi_out = out_bgr[y0:y1, x0:x1].astype(np.float32)
             roi_src = frame_bgr[y0:y1, x0:x1].astype(np.float32)
             out_bgr[y0:y1, x0:x1] = np.clip(roi_out * a3 + roi_src * (1.0 - a3), 0.0, 255.0).astype(np.uint8)
             out_mask = out_mask.copy()
-            out_mask[y0:y1, x0:x1][vos_alpha < 0.45] = 0
+            roi_m = out_mask[y0:y1, x0:x1]
+            roi_m[vos_alpha < 0.45] = 0
+            # Close 1px UV-seam cracks and remove tiny stray specks (< 2.5% of main component,
+            # or < 15% on monochrome cylinders where bright knuckles can form small islands below a gripping thumb)
+            if int(np.count_nonzero(roi_m)) >= 64:
+                n_cc, cc_lbl, cc_stats, _ = cv2.connectedComponentsWithStats((roi_m > 0).astype(np.uint8), connectivity=8)
+                if n_cc > 2:
+                    max_a = int(cc_stats[1:, cv2.CC_STAT_AREA].max())
+                    keep_frac = 0.22 if (self._mono_bright_fg_L_lo is not None and mode in ("cylinder", "mesh_6dof")) else 0.025
+                    min_keep = max(24, int(keep_frac * max_a))
+                    for lbl in range(1, n_cc):
+                        if int(cc_stats[lbl, cv2.CC_STAT_AREA]) < min_keep:
+                            roi_m[cc_lbl == lbl] = 0
+            out_mask[y0:y1, x0:x1] = roi_m
+            # Also suppress RGB overlay on pruned speck pixels so no faint specks remain
+            pruned_b = (roi_m == 0) & (vos_alpha >= 0.45)
+            if np.any(pruned_b):
+                out_bgr[y0:y1, x0:x1][pruned_b] = frame_bgr[y0:y1, x0:x1][pruned_b]
             if int(np.count_nonzero(out_mask)) < 24:
                 return frame_bgr, None, (time.perf_counter() - t0) * 1000.0
             comp_ms = (time.perf_counter() - t0) * 1000.0

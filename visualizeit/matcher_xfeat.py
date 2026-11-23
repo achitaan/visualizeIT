@@ -113,8 +113,8 @@ class XFeatMatcher:
             img_in = cv2.resize(crop, (sw, sh), interpolation=cv2.INTER_AREA)
             inv_sx = float(cw) / float(sw)
             inv_sy = float(ch) / float(sh)
-        elif roi is not None and max_side < 160:
-            scale = min(2.0, 192.0 / float(max(max_side, 1)))
+        elif roi is not None and max_side < 260:
+            scale = min(2.0, 288.0 / float(max(max_side, 1)))
             sw = max(32, int(round(cw * scale)))
             sh = max(32, int(round(ch * scale)))
             img_in = cv2.resize(crop, (sw, sh), interpolation=cv2.INTER_CUBIC)
@@ -129,7 +129,7 @@ class XFeatMatcher:
         tensor = torch.from_numpy(rgb.transpose(2, 0, 1)).unsqueeze(0).float().to(self._model.dev) / 255.0
 
         with torch.inference_mode():
-            out = self._model.detectAndCompute(tensor, top_k=int(top_k), detection_threshold=0.04)[0]
+            out = self._model.detectAndCompute(tensor, top_k=int(top_k), detection_threshold=0.025)[0]
 
         kpts = out["keypoints"].detach().cpu().numpy().astype(np.float32)
         descs = out["descriptors"].detach().cpu().numpy().astype(np.float32)

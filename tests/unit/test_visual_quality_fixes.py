@@ -302,3 +302,120 @@ def test_6dof_degraded_frame_never_inserts_corrupted_keyframe() -> None:
     assert r1.confidence_state == "LOST"
     assert len(tracker._mesh_keyframes) == kf_init
 
+
+def test_neural_modules_availability_and_fallback() -> None:
+    """Verify EdgeTAM and XFeat availability functions report clean booleans."""
+    from visualizeit.matcher_xfeat import is_xfeat_available
+    from visualizeit.vos_edgetam import is_edgetam_available
+
+    has_vos = is_edgetam_available()
+    has_xf = is_xfeat_available()
+    assert isinstance(has_vos, bool)
+    assert isinstance(has_xf, bool)
+
+
+def test_edgetam_session_lifecycle_and_pruning() -> None:
+    """Test EdgeTAM session initialization, optical flow interpolation, and O(1) memory pruning."""
+    from visualizeit.vos_edgetam import EdgeTAMSession, is_edgetam_available
+
+    if not is_edgetam_available():
+        pytest.skip("EdgeTAM weights not cached in test environment")
+
+    sess = EdgeTAMSession(vos_stride=2, memory_window=4)
+    frame = np.full((120, 160, 3), 40, dtype=np.uint8)
+    cv2.circle(frame, (80, 60), 25, (220, 220, 220), -1)
+
+    sel = SelectionSpec(
+        frame_index=0,
+        positive_points=[(80.0, 60.0)],
+        bbox=(50.0, 30.0, 60.0, 60.0),
+    )
+    seg = sess.initialize(frame, sel)
+    assert seg.init_valid
+    assert seg.mask is not None
+    assert int(np.count_nonzero(seg.mask)) > 400
+
+    # Step frame 1 (intermediate -> flow)
+    frame_next = np.roll(frame, 2, axis=1)
+    m1 = sess.step(frame_next, 1)
+    assert m1.shape == (120, 160)
+    assert int(np.count_nonzero(m1)) > 300
+
+    # Step frame 2 (VOS keyframe)
+    m2 = sess.step(frame_next, 2)
+    assert m2.shape == (120, 160)
+    assert int(np.count_nonzero(m2)) > 300
+
+    # Step through frame 6 and confirm state images dict does not grow unboundedly
+    for idx in range(3, 7):
+        sess.step(frame_next, idx)
+    assert len(sess._state["images"]) <= 6
+
+
+def test_xfeat_matcher_small_roi_upsampling() -> None:
+    """Test that XFeat extractor upsamples small handheld ROIs so valid keypoints are detected."""
+    from visualizeit.matcher_xfeat import XFeatMatcher, is_xfeat_available
+
+    if not is_xfeat_available():
+        pytest.skip("XFeat weights not cached in test environment")
+
+    matcher = XFeatMatcher()
+    tiny_roi = np.full((64, 64, 3), 50, dtype=np.uint8)
+    rng = np.random.default_rng(42)
+    for _ in range(12):
+        x, y = int(rng.integers(10, 50)), int(rng.integers(10, 50))
+        cv2.rectangle(tiny_roi, (x, y), (x + 6, y + 6), (200, 220, 240), -1)
+
+    kpts, feats = matcher.extract(tiny_roi)
+    assert kpts.ndim == 2 and kpts.shape[1] == 2
+    assert feats.ndim == 2 and feats.shape[1] == 64
+    assert len(kpts) > 0
+
+
+def test_pipeline_session_with_neural_backends() -> None:
+    """Test full VideoPipelineSession end-to-end with neural backends."""
+    from visualizeit.contracts import DesignSpec, PlacementSpec
+    from visualizeit.matcher_xfeat import is_xfeat_available
+    from visualizeit.pipeline import VideoPipelineSession
+    from visualizeit.vos_edgetam import is_edgetam_available
+
+    if not (is_edgetam_available() and is_xfeat_available()):
+        pytest.skip("Neural weights not cached")
+
+    design = DesignSpec(
+        source="recipe",
+        pattern="checker",
+        width=128,
+        height=128,
+    )
+    placement = PlacementSpec(wrap_mode="planar", opacity=0.9)
+    session = VideoPipelineSession(
+        design=design,
+        placement=placement,
+        segmentation_backend="edgetam",
+        matcher_backend="xfeat",
+        vos_stride=2,
+    )
+
+    frame = np.full((120, 160, 3), 40, dtype=np.uint8)
+    cv2.rectangle(frame, (40, 30), (120, 90), (200, 180, 160), -1)
+    rng = np.random.default_rng(123)
+    for _ in range(25):
+        x, y = int(rng.integers(45, 110)), int(rng.integers(35, 82))
+        cv2.rectangle(frame, (x, y), (x + 4, y + 4), (int(rng.integers(10, 80)), int(rng.integers(10, 80)), int(rng.integers(10, 80))), -1)
+
+    sel = SelectionSpec(
+        frame_index=0,
+        positive_points=[(80.0, 60.0)],
+        bbox=(38.0, 28.0, 84.0, 64.0),
+    )
+    out0 = session.initialize(frame, sel, timestamp_s=0.0)
+    assert out0.rendered_mask is not None
+    assert out0.track_result.confidence_state in ("TRACKING", "RECOVERING")
+
+    frame1 = np.roll(frame, 1, axis=1)
+    out1 = session.process_frame(frame1, 1, timestamp_s=0.033)
+    assert out1.rendered_mask is not None
+    assert session.last_vos_mask is not None
+
+

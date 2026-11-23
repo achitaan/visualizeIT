@@ -313,7 +313,14 @@ class VideoPipelineSession:
         sharp_onboarding: bool = True,
         grazing_angle_gate: bool = False,
         max_klt_points: int = 180,
+        segmentation_backend: Literal["grabcut", "edgetam"] = "grabcut",
+        matcher_backend: Literal["orb", "xfeat"] = "orb",
+        vos_stride: int = 3,
     ) -> None:
+        if segmentation_backend not in ("grabcut", "edgetam"):
+            raise ContractValidationError(f"Invalid segmentation_backend: {segmentation_backend!r}")
+        if matcher_backend not in ("orb", "xfeat"):
+            raise ContractValidationError(f"Invalid matcher_backend: {matcher_backend!r}")
         self.design = design
         self.placement = placement
         self.artwork_rgba = _resolve_artwork_rgba(design)
@@ -323,6 +330,9 @@ class VideoPipelineSession:
         self.local_occlusion_mask = bool(local_occlusion_mask)
         self.occlusion_mode = occlusion_mode
         self.sharp_onboarding = bool(sharp_onboarding)
+        self.segmentation_backend: Literal["grabcut", "edgetam"] = segmentation_backend
+        self.matcher_backend: Literal["orb", "xfeat"] = matcher_backend
+        self.vos_stride = max(1, int(vos_stride))
 
         self.tracker = VideoSurfaceTracker(
             wrap_mode=placement.wrap_mode,
@@ -334,9 +344,12 @@ class VideoPipelineSession:
             mesh=self.mesh,
             intrinsics=intrinsics,
             init_pose=init_pose,
+            matcher_backend=matcher_backend,
         )
         self.compositor: SurfaceCompositor | None = None
         self.segmentation: SegmentationResult | None = None
+        self._vos_session: Any = None
+        self.last_vos_mask: np.ndarray | None = None
         self._initialized = False
 
     def initialize(
@@ -347,7 +360,16 @@ class VideoPipelineSession:
     ) -> FrameProcessOutput:
         """One-time frame segmentation + tracker onboarding + first-frame composite."""
         t_prep0 = time.perf_counter()
-        seg = segment_frame(frame_bgr, selection, sharp_onboarding=self.sharp_onboarding)
+        vos_mask: np.ndarray | None = None
+        if self.segmentation_backend == "edgetam":
+            from .vos_edgetam import EdgeTAMSession
+
+            self._vos_session = EdgeTAMSession(vos_stride=self.vos_stride)
+            seg = self._vos_session.initialize(frame_bgr, selection)
+            vos_mask = seg.mask
+            self.last_vos_mask = vos_mask
+        else:
+            seg = segment_frame(frame_bgr, selection, sharp_onboarding=self.sharp_onboarding)
         self.segmentation = seg
         prep_ms = (time.perf_counter() - t_prep0) * 1000.0
 
@@ -374,7 +396,7 @@ class VideoPipelineSession:
         )
         self._initialized = True
 
-        out_bgr, mask, comp_ms = self.compositor.composite(frame_bgr, track_res)
+        out_bgr, mask, comp_ms = self.compositor.composite(frame_bgr, track_res, external_fg_mask=vos_mask)
         return FrameProcessOutput(
             frame_bgr=out_bgr,
             track_result=track_res,
@@ -396,11 +418,15 @@ class VideoPipelineSession:
         t_prep0 = time.perf_counter()
         if frame_bgr.ndim != 3 or frame_bgr.shape[2] != 3 or frame_bgr.dtype != np.uint8:
             raise ContractValidationError("frame_bgr must be HxWx3 uint8")
+        vos_mask: np.ndarray | None = None
+        if self._vos_session is not None:
+            vos_mask = self._vos_session.step(frame_bgr, frame_index)
+            self.last_vos_mask = vos_mask
         prep_ms = (time.perf_counter() - t_prep0) * 1000.0
 
-        track_res = self.tracker.track_frame(frame_bgr, frame_index, timestamp_s)
-        out_bgr, mask, comp_ms = self.compositor.composite(frame_bgr, track_res)
-        if hasattr(self.tracker, "set_occluder_mask"):
+        track_res = self.tracker.track_frame(frame_bgr, frame_index, timestamp_s, external_fg_mask=vos_mask)
+        out_bgr, mask, comp_ms = self.compositor.composite(frame_bgr, track_res, external_fg_mask=vos_mask)
+        if vos_mask is None and hasattr(self.tracker, "set_occluder_mask"):
             self.tracker.set_occluder_mask(self.compositor.last_occluder_mask_img)
         return FrameProcessOutput(
             frame_bgr=out_bgr,
@@ -501,6 +527,9 @@ class VideoPipeline:
         grazing_angle_gate: bool = False,
         overlap_io: bool = False,
         offline_refine: bool = False,
+        segmentation_backend: Literal["grabcut", "edgetam"] = "grabcut",
+        matcher_backend: Literal["orb", "xfeat"] = "orb",
+        vos_stride: int = 3,
         report_path: str | os.PathLike[str] | None = None,
         trace_records: list[dict[str, Any]] | None = None,
     ) -> VideoRunReport:
@@ -540,6 +569,9 @@ class VideoPipeline:
             local_occlusion_mask=local_occlusion_mask,
             sharp_onboarding=sharp_onboarding,
             grazing_angle_gate=grazing_angle_gate,
+            segmentation_backend=segmentation_backend,
+            matcher_backend=matcher_backend,
+            vos_stride=vos_stride,
         )
 
         # ---- FULL WALL CLOCK: input open through final encoder flush ----

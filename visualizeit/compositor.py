@@ -78,6 +78,98 @@ def _skin_prob_bgr(bgr: np.ndarray) -> np.ndarray:
     return np.where(valid_rgb, p, 0.0).astype(np.float32)
 
 
+def _guided_filter_alpha(
+    guide_gray_u8: np.ndarray,
+    mask_f32: np.ndarray,
+    *,
+    radius: int = 4,
+    eps: float = 0.012,
+) -> np.ndarray:
+    """Fast O(1) subsampled guided filter (He & Sun 2015) snapping soft masks to full-res image edges."""
+    h, w = guide_gray_u8.shape[:2]
+    I_full = guide_gray_u8.astype(np.float32) * (1.0 / 255.0)
+    if h >= 48 and w >= 48:
+        sh, sw = max(16, h // 2), max(16, w // 2)
+        I = cv2.resize(I_full, (sw, sh), interpolation=cv2.INTER_AREA)
+        p = cv2.resize(mask_f32.astype(np.float32), (sw, sh), interpolation=cv2.INTER_AREA)
+        r_s = max(1, radius // 2)
+        k = (2 * r_s + 1, 2 * r_s + 1)
+        mean_I = cv2.boxFilter(I, cv2.CV_32F, k)
+        mean_p = cv2.boxFilter(p, cv2.CV_32F, k)
+        mean_Ip = cv2.boxFilter(I * p, cv2.CV_32F, k)
+        cov_Ip = mean_Ip - mean_I * mean_p
+        mean_II = cv2.boxFilter(I * I, cv2.CV_32F, k)
+        var_I = np.maximum(mean_II - mean_I * mean_I, 0.0)
+        a = cov_Ip / (var_I + eps)
+        b = mean_p - a * mean_I
+        mean_a = cv2.resize(cv2.boxFilter(a, cv2.CV_32F, k), (w, h), interpolation=cv2.INTER_LINEAR)
+        mean_b = cv2.resize(cv2.boxFilter(b, cv2.CV_32F, k), (w, h), interpolation=cv2.INTER_LINEAR)
+        return np.clip(mean_a * I_full + mean_b, 0.0, 1.0)
+    p = mask_f32.astype(np.float32)
+    k = (2 * radius + 1, 2 * radius + 1)
+    mean_I = cv2.boxFilter(I_full, cv2.CV_32F, k)
+    mean_p = cv2.boxFilter(p, cv2.CV_32F, k)
+    mean_Ip = cv2.boxFilter(I_full * p, cv2.CV_32F, k)
+    cov_Ip = mean_Ip - mean_I * mean_p
+    mean_II = cv2.boxFilter(I_full * I_full, cv2.CV_32F, k)
+    var_I = np.maximum(mean_II - mean_I * mean_I, 0.0)
+    a = cov_Ip / (var_I + eps)
+    b = mean_p - a * mean_I
+    mean_a = cv2.boxFilter(a, cv2.CV_32F, k)
+    mean_b = cv2.boxFilter(b, cv2.CV_32F, k)
+    return np.clip(mean_a * I_full + mean_b, 0.0, 1.0)
+
+
+def _compute_oriented_cylinder_frame(
+    ref_mask: np.ndarray | None,
+    ref_bbox: tuple[int, int, int, int],
+) -> tuple[tuple[float, float], float, float, float] | None:
+    """Return (center_xy, width, height, angle_rad) if ref_mask is clearly elongated and tilted (>= 8 deg)."""
+    if ref_mask is None or int(np.count_nonzero(ref_mask)) < 120:
+        return None
+    ys, xs = np.nonzero(ref_mask > 127)
+    if len(xs) < 120:
+        return None
+    pts = np.column_stack([xs.astype(np.float32), ys.astype(np.float32)])
+    (cx, cy), (rw, rh), angle_deg = cv2.minAreaRect(pts)
+    if rw < 6.0 or rh < 6.0:
+        return None
+    # Orient so major axis (height) points roughly upward-downward (closest to vertical)
+    if rw > rh:
+        eff_w, eff_h = float(rh), float(rw)
+        axis_deg = float(angle_deg) + 90.0
+    else:
+        eff_w, eff_h = float(rw), float(rh)
+        axis_deg = float(angle_deg)
+    # Normalize axis_deg into [-90, 90] (0 = vertical upright cylinder)
+    while axis_deg > 90.0:
+        axis_deg -= 180.0
+    while axis_deg < -90.0:
+        axis_deg += 180.0
+    aspect = eff_h / max(eff_w, 1.0)
+    if aspect < 1.45 or abs(axis_deg) < 8.0 or abs(axis_deg) > 78.0:
+        return None
+    return (float(cx), float(cy)), eff_w, eff_h, math.radians(axis_deg)
+
+
+def _fill_enclosed_holes_bool(mask_b: np.ndarray) -> np.ndarray:
+    """Fill strictly enclosed interior holes in a 2D boolean mask without expanding exterior silhouette."""
+    u8 = np.where(mask_b, np.uint8(255), np.uint8(0))
+    inv = cv2.bitwise_not(u8)
+    n_cc, labels, _, _ = cv2.connectedComponentsWithStats(inv, connectivity=4)
+    if n_cc <= 2:
+        return mask_b
+    border_lbls = set(np.unique(labels[0, :]).tolist())
+    border_lbls.update(np.unique(labels[-1, :]).tolist())
+    border_lbls.update(np.unique(labels[:, 0]).tolist())
+    border_lbls.update(np.unique(labels[:, -1]).tolist())
+    out = mask_b.copy()
+    for lbl in range(1, n_cc):
+        if lbl not in border_lbls:
+            out[labels == lbl] = True
+    return out
+
+
 class SurfaceCompositor:
     """Composites 2D RGBA artwork onto tracked surfaces using native C++17 AVX-512 or OpenCV backend."""
 
@@ -113,25 +205,67 @@ class SurfaceCompositor:
         else:
             raise ContractValidationError(f"Invalid raster_backend: {raster_backend!r}")
 
-        # Crop surface mask to ref_bbox for planar/cylinder/mesh_grid alpha clipping
+        # Optional oriented cylinder frame for tilted elongated objects (e.g. handheld bottles)
+        self._cyl_oriented: tuple[tuple[float, float], float, float, float] | None = None
+        if placement.wrap_mode == "cylinder" and ref_mask is not None:
+            self._cyl_oriented = _compute_oriented_cylinder_frame(ref_mask, self.ref_bbox)
+
+        # Crop/align surface mask to ref_bbox (or oriented cylinder box) for 2D alpha clipping
         mask_crop: np.ndarray | None = None
+        mask_crop_for_tex: np.ndarray | None = None
         if ref_mask is not None and placement.wrap_mode != "mesh_6dof":
-            bx, by, bw, bh = self.ref_bbox
-            h, w = ref_mask.shape[:2]
-            x0, y0 = max(0, bx), max(0, by)
-            x1, y1 = min(w, bx + bw), min(h, by + bh)
-            if x1 > x0 and y1 > y0:
-                crop = ref_mask[y0:y1, x0:x1]
-                # Only apply silhouette clipping if mask is non-trivial (>= 20% of bbox)
-                if float(np.count_nonzero(crop)) / float(crop.size) >= 0.20:
+            if placement.wrap_mode == "cylinder" and self._cyl_oriented is not None:
+                (ocx, ocy), ow, oh, oang = self._cyl_oriented
+                ca, sa = math.cos(oang), math.sin(oang)
+                hw, hh = 0.5 * ow, 0.5 * oh
+                src_quad = np.array([
+                    [ocx - hw * ca + hh * sa, ocy - hw * sa - hh * ca],
+                    [ocx + hw * ca + hh * sa, ocy + hw * sa - hh * ca],
+                    [ocx + hw * ca - hh * sa, ocy + hw * sa + hh * ca],
+                    [ocx - hw * ca - hh * sa, ocy - hw * sa + hh * ca],
+                ], dtype=np.float32)
+                mw, mh = max(16, int(round(ow))), max(16, int(round(oh)))
+                dst_quad = np.array([[0, 0], [mw - 1, 0], [mw - 1, mh - 1], [0, mh - 1]], dtype=np.float32)
+                M_o = cv2.getPerspectiveTransform(src_quad, dst_quad)
+                crop = cv2.warpPerspective(ref_mask, M_o, (mw, mh), flags=cv2.INTER_LINEAR, borderValue=0)
+                if float(np.count_nonzero(crop > 127)) / float(crop.size) >= 0.20:
                     mask_crop = crop
+            else:
+                bx, by, bw, bh = self.ref_bbox
+                h, w = ref_mask.shape[:2]
+                x0, y0 = max(0, bx), max(0, by)
+                x1, y1 = min(w, bx + bw), min(h, by + bh)
+                if x1 > x0 and y1 > y0:
+                    crop = ref_mask[y0:y1, x0:x1]
+                    if float(np.count_nonzero(crop)) / float(crop.size) >= 0.20:
+                        mask_crop = crop
+
+            mask_crop_for_tex = mask_crop
+            # In cylinder mode, vertices map u -> x_frac = 0.5 + 0.5*sin(theta)/sin(max_arc).
+            # Remap mask_crop through the exact same sin(theta) mapping so tapered bottle shoulders
+            # NEVER bulge outward into empty air!
+            if placement.wrap_mode == "cylinder" and mask_crop is not None:
+                mh_c, mw_c = mask_crop.shape[:2]
+                half_arc = math.radians(
+                    min(82.0, max(35.0, 74.0 * math.sqrt(max(0.15, placement.cylinder_radius_frac) / 0.5)))
+                )
+                sin_max = math.sin(half_arc)
+                u_g = np.linspace(0.0, 1.0, mw_c, dtype=np.float32)
+                thetas = (u_g * 2.0 - 1.0) * half_arc
+                x_fracs = 0.5 + 0.5 * (np.sin(thetas) / sin_max)
+                mx_c = np.clip(x_fracs * float(mw_c - 1), 0.0, float(mw_c - 1)).astype(np.float32)
+                my_c = np.arange(mh_c, dtype=np.float32)
+                cmap_x, cmap_y = np.meshgrid(mx_c, my_c)
+                mask_crop_for_tex = cv2.remap(mask_crop, cmap_x, cmap_y, cv2.INTER_LINEAR, borderValue=0)
 
         # For mesh_6dof we keep full texture (placement applied via texture transform; mesh geometry defines silhouette)
+        self._artwork_rgba = artwork_rgba
         self._placed_rgba = _prepare_placed_texture(
             artwork_rgba,
             placement,
-            surface_mask_crop=mask_crop if placement.wrap_mode != "mesh_6dof" else None,
+            surface_mask_crop=mask_crop_for_tex if placement.wrap_mode != "mesh_6dof" else None,
         )
+        self._placed_rgba_unclipped: np.ndarray | None = None
 
         # Prebuild canonical local 2D grids for planar, cylinder, and mesh_grid
         self._planar_uvs, self._planar_tris = self._build_grid_topology(2, 2)
@@ -163,11 +297,15 @@ class SurfaceCompositor:
         self._occ_cyl_map_y: np.ndarray | None = None
         self._work_rgba: np.ndarray | None = None
         self._base_alpha_u8: np.ndarray | None = None
+        self._last_2d_occ_u8: np.ndarray | None = None
 
         # 6-DoF 3D-projected UV reference + image-space exterior hand/occluder state
         self._occ_6dof_enabled = False
         self._occ_6dof_is_color = True
         self._occ_6dof_ref_skin_frac = 0.0
+        self._occ_6dof_ref_L_lo = 0.0
+        self._occ_6dof_ref_L_hi = 255.0
+        self._occ_6dof_ref_L_med = 128.0
         self._occ_6dof_target_lab_lut: np.ndarray | None = None
         self._occ_6dof_uv_pts3d: np.ndarray | None = None
         self._occ_6dof_uv_norms: np.ndarray | None = None
@@ -204,10 +342,21 @@ class SurfaceCompositor:
         sz = self._occ_size
         pad = self._occ_pad
         full = self._occ_full
-        ref_quad = np.array(
-            [[bx, by], [bx + bw, by], [bx + bw, by + bh], [bx, by + bh]],
-            dtype=np.float32,
-        )
+        if self.placement.wrap_mode == "cylinder" and self._cyl_oriented is not None:
+            (ocx, ocy), ow, oh, oang = self._cyl_oriented
+            ca, sa = math.cos(oang), math.sin(oang)
+            hw, hh = 0.5 * ow, 0.5 * oh
+            ref_quad = np.array([
+                [ocx - hw * ca + hh * sa, ocy - hw * sa - hh * ca],
+                [ocx + hw * ca + hh * sa, ocy + hw * sa - hh * ca],
+                [ocx + hw * ca - hh * sa, ocy + hw * sa + hh * ca],
+                [ocx - hw * ca - hh * sa, ocy - hw * sa + hh * ca],
+            ], dtype=np.float32)
+        else:
+            ref_quad = np.array(
+                [[bx, by], [bx + bw, by], [bx + bw, by + bh], [bx, by + bh]],
+                dtype=np.float32,
+            )
         p = float(pad)
         s = float(sz)
         canon_quad = np.array([[p, p], [p + s - 1.0, p], [p + s - 1.0, p + s - 1.0], [p, p + s - 1.0]], dtype=np.float32)
@@ -221,7 +370,7 @@ class SurfaceCompositor:
 
         tmask = np.zeros((full, full), dtype=bool)
         if ref_mask is not None and ref_mask.size > 0:
-            tmask[pad:-pad, pad:-pad] = cv2.resize(ref_mask, (sz, sz), interpolation=cv2.INTER_NEAREST) > 127
+            tmask[pad:-pad, pad:-pad] = cv2.resize(ref_mask, (sz, sz), interpolation=cv2.INTER_LINEAR) > 127
         if int(np.count_nonzero(tmask)) < 64:
             tmask[pad:-pad, pad:-pad] = True
 
@@ -288,8 +437,15 @@ class SurfaceCompositor:
         if ref_mask is not None and int(np.count_nonzero(ref_mask)) >= 64:
             m_bool = ref_mask > 127
             self._occ_6dof_ref_skin_frac = float(np.mean(ref_skin[m_bool] > 0.45))
+            ref_gray = cv2.cvtColor(ref_frame_bgr, cv2.COLOR_BGR2GRAY)
+            l_vals = ref_gray[m_bool].astype(np.float32)
+            self._occ_6dof_ref_L_lo = float(np.percentile(l_vals, 5))
+            self._occ_6dof_ref_L_hi = float(np.percentile(l_vals, 95))
+            self._occ_6dof_ref_L_med = float(np.median(l_vals))
             # Build quantized 3D (L, a, b) color histogram of the target object (bins: L/24, a/10, b/10)
-            # requiring >= 1.5% pixel occupancy per bin so anti-aliased red/white label edges NEVER whitelist human skin.
+            # requiring >= 1.5% occupancy per bin so anti-aliased edge pixels never whitelist background/skin.
+            # Secondary object label colors (e.g. orange soup band, red/white paper labels) are protected
+            # via exact per-pixel 3D UV reference matching inside _compute_6dof_exterior_hand_mask!
             counts = np.zeros((12, 27, 27), dtype=np.int32)
             pts_lab = ref_lab_u8[m_bool]
             l_idx = np.clip(pts_lab[:, 0] // 24, 0, 11)
@@ -310,6 +466,9 @@ class SurfaceCompositor:
         self._work_rgba = np.ascontiguousarray(self._placed_rgba.copy(), dtype=np.uint8)
         self._base_alpha_u8 = np.ascontiguousarray(self._placed_rgba[:, :, 3], dtype=np.uint8)
         self._occ_6dof_prev_vis_uv = None
+        self._occ_6dof_cyl_h: float = 0.14
+        self._occ_6dof_y_min: float = -0.07
+        self._last_6dof_gain: float = 1.0
 
         # If mesh is a parametric cylinder and we have init_pose, bake visible frame-0 surface into 96x64 UV reference
         if (
@@ -330,6 +489,8 @@ class SurfaceCompositor:
             v_radii = np.hypot(verts[:, 0], verts[:, 2])
             cyl_h = float(np.ptp(verts[:, 1]))
             y_min_v = float(verts[:, 1].min())
+            self._occ_6dof_cyl_h = max(cyl_h, 1e-4)
+            self._occ_6dof_y_min = y_min_v
             uw, vh = 96, 64
             us = np.linspace(0.0, 1.0, uw, dtype=np.float64)
             vs = np.linspace(0.0, 1.0, vh, dtype=np.float64)
@@ -365,34 +526,35 @@ class SurfaceCompositor:
 
             in_bounds = (mx >= 1) & (mx < w - 1) & (my >= 1) & (my < h - 1) & front_2d
             if ref_mask is not None:
-                m_uv = cv2.remap(ref_mask, mx, my, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT) > 127
-                in_bounds &= m_uv
-                # Clip front-visible UV texels that fell outside frame-0 segmentation mask ONLY when
-                # significant overhang exists (>= 6% of front area: e.g., tapered bottle neck or YCB pitcher + mustard bottle).
+                m_uv = cv2.remap(ref_mask, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT) > 127
+                # Fill any enclosed interior holes before clipping shape so labels/barcodes never become permanent holes
+                m_uv_filled = _fill_enclosed_holes_bool(m_uv)
+                in_bounds &= m_uv_filled
                 front_observed = (mx >= 1) & (mx < w - 1) & (my >= 1) & (my < h - 1) & front_2d
                 n_front_obs = int(np.count_nonzero(front_observed))
-                out_frac = float(np.count_nonzero(front_observed & (~m_uv))) / float(max(n_front_obs, 1))
+                out_frac = float(np.count_nonzero(front_observed & (~m_uv_filled))) / float(max(n_front_obs, 1))
                 if out_frac >= 0.06:
                     uv_shape = np.ones((vh, uw), dtype=bool)
-                    uv_shape[front_observed] = m_uv[front_observed]
+                    uv_shape[front_observed] = m_uv_filled[front_observed]
                     uv_shape_u8 = cv2.dilate(uv_shape.astype(np.uint8) * 255, np.ones((3, 3), np.uint8), iterations=1)
                     tex_h, tex_w = self._base_alpha_u8.shape
                     shape_tex = cv2.resize(uv_shape_u8, (tex_w, tex_h), interpolation=cv2.INTER_LINEAR)
                     self._base_alpha_u8 = cv2.multiply(self._base_alpha_u8, shape_tex, scale=1.0 / 255.0)
                     self._work_rgba[:, :, 3] = self._base_alpha_u8
 
-            # 3x3 Birchfield-Tomasi spatial tolerance bounds in UV space to prevent rotational edge-shift erosion
-            k3 = np.ones((3, 3), np.uint8)
+            # 5x5 Birchfield-Tomasi spatial tolerance bounds in UV space to prevent rotational edge-shift erosion
+            # on high-contrast printed text/logos during 360-deg spin.
+            k5 = np.ones((5, 5), np.uint8)
             ref_L = np.ascontiguousarray(baked_lab[:, :, 0], dtype=np.float32)
             ref_ab = np.ascontiguousarray(baked_lab[:, :, 1:3], dtype=np.float32)
             self._occ_6dof_uv_pts3d = pts3d
             self._occ_6dof_uv_norms = norms
             self._occ_6dof_ref_uv_L = ref_L
-            self._occ_6dof_ref_uv_L_min = np.ascontiguousarray(cv2.erode(ref_L, k3), dtype=np.float32)
-            self._occ_6dof_ref_uv_L_max = np.ascontiguousarray(cv2.dilate(ref_L, k3), dtype=np.float32)
+            self._occ_6dof_ref_uv_L_min = np.ascontiguousarray(cv2.erode(ref_L, k5), dtype=np.float32)
+            self._occ_6dof_ref_uv_L_max = np.ascontiguousarray(cv2.dilate(ref_L, k5), dtype=np.float32)
             self._occ_6dof_ref_uv_ab = ref_ab
-            self._occ_6dof_ref_uv_ab_min = np.ascontiguousarray(cv2.erode(ref_ab, k3), dtype=np.float32)
-            self._occ_6dof_ref_uv_ab_max = np.ascontiguousarray(cv2.dilate(ref_ab, k3), dtype=np.float32)
+            self._occ_6dof_ref_uv_ab_min = np.ascontiguousarray(cv2.erode(ref_ab, k5), dtype=np.float32)
+            self._occ_6dof_ref_uv_ab_max = np.ascontiguousarray(cv2.dilate(ref_ab, k5), dtype=np.float32)
             self._occ_6dof_ref_uv_valid = in_bounds
 
         self._occ_6dof_enabled = True
@@ -509,30 +671,42 @@ class SurfaceCompositor:
 
             seed_mask = (occ & tmask & (cur_grad < 22.0)).astype(np.uint8)
             t_u8 = tmask.astype(np.uint8) * 255
-            border_in = (t_u8 > 0) & (cv2.erode(t_u8, np.ones((7, 7), np.uint8)) == 0)
-            dl_bridge = 10.0 if self._occ_is_color else 7.5
-            border_bridge = border_in & (cur_grad < 18.0) & ((dL_s > dl_bridge) | (dab_s > 10.0) | tex_destroyed | (ncc < 0.35))
+            border_in = (t_u8 > 0) & (cv2.erode(t_u8, np.ones((5, 5), np.uint8)) == 0)
+            dl_bridge = 14.0 if self._occ_is_color else 10.0
+            border_bridge = border_in & (cur_grad < 18.0) & ((dL_s > dl_bridge) | (dab_s > 13.0) | tex_destroyed | (ncc < 0.30))
             seed_mask[border_bridge] = 1
 
-            smooth = (cur_grad < 22.0).astype(np.uint8)
+            # Require gradient < 22.0 AND non-matching appearance (or exterior) so beige hands (f=51, dL~26, grad~15)
+            # and beige bars (f=85) flood cleanly while NEVER leaking into unoccluded matching card pixels (f=102, dL<2)!
+            if self.placement.wrap_mode == "cylinder":
+                smooth_changed = (~tmask) | (dL_s > 14.0) | (dab_s > 14.0) | (ncc < 0.45) | tex_destroyed
+            else:
+                smooth_changed = (~tmask) | (dL_s > 4.5) | (dab_s > 4.5) | (ncc < 0.68) | tex_destroyed
+            smooth = ((cur_grad < 22.0) & smooth_changed).astype(np.uint8)
+            skin_seed = np.zeros_like(seed_mask)
+            if self._occ_is_color:
+                skin_seed = ((skin_excess > 0.25) & tmask).astype(np.uint8)
             n_cc, cc_labels, _, _ = cv2.connectedComponentsWithStats(smooth, connectivity=4)
             if n_cc > 1:
                 flat_lbl = cc_labels.ravel()
                 ext_cnt = np.bincount(flat_lbl, weights=(~tmask).ravel().astype(np.float32), minlength=n_cc)
                 in_cnt = np.bincount(flat_lbl, weights=tmask.ravel().astype(np.float32), minlength=n_cc)
                 seed_cnt = np.bincount(flat_lbl, weights=seed_mask.ravel().astype(np.float32), minlength=n_cc)
+                skin_cnt = np.bincount(flat_lbl, weights=skin_seed.ravel().astype(np.float32), minlength=n_cc)
                 is_fg_cc = np.zeros(n_cc, dtype=bool)
                 min_seed_frac = 0.14 if self._occ_is_color else 0.08
                 min_seed_cnt = 12 if self._occ_is_color else 8
                 for lbl in range(1, n_cc):
                     if ext_cnt[lbl] >= 10 and in_cnt[lbl] >= 18:
                         seed_frac = seed_cnt[lbl] / max(in_cnt[lbl], 1.0)
-                        if seed_frac >= min_seed_frac and seed_cnt[lbl] >= min_seed_cnt:
+                        if (seed_frac >= min_seed_frac and seed_cnt[lbl] >= min_seed_cnt) or (
+                            seed_cnt[lbl] >= 8 and (seed_frac >= 0.06) and (skin_cnt[lbl] >= 4 or ext_cnt[lbl] >= 40)
+                        ):
                             is_fg_cc[lbl] = True
                 if np.any(is_fg_cc):
                     fg_grown = is_fg_cc[cc_labels]
                     fg_grown_u8 = cv2.dilate(
-                        fg_grown.astype(np.uint8) * 255, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                        fg_grown.astype(np.uint8) * 255, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
                     )
                     occ |= fg_grown_u8 > 0
 
@@ -546,7 +720,10 @@ class SurfaceCompositor:
                 )
                 mag_half = np.hypot(flow[:, :, 0], flow[:, :, 1])
                 mag = cv2.resize(mag_half, (full, full), interpolation=cv2.INTER_LINEAR)
-                occ |= (mag > 1.0) & ((dL_s > 7.0) | (dab_s > 7.0) | (ncc < 0.60))
+                if self.placement.wrap_mode == "cylinder":
+                    occ |= (mag > 1.8) & ((dL_s > 20.0) | (dab_s > 18.0))
+                else:
+                    occ |= (mag > 1.0) & ((dL_s > 8.0) | (dab_s > 8.0) | (ncc < 0.58))
             self._occ_prev_L_half = cur_L_half
 
         # Luminance-only shadow protection: identical local texture (ncc >= 0.78) + invariant RGB chromaticity is a shadow, never a foreign occluder
@@ -558,44 +735,67 @@ class SurfaceCompositor:
             is_pure_shadow = (self._occ_ref_std > 4.0) & (shadow_ncc >= 0.78) & (chrom_diff < 0.06) & (cur_L < self._occ_ref_L + 10.0)
             occ &= ~is_pure_shadow
 
-        occ_crop = occ[pad:-pad, pad:-pad]
+        # Suppress tiny isolated interior noise specks that do not touch the silhouette boundary
+        occ_in = occ & tmask
+        t_er = cv2.erode(tmask.astype(np.uint8) * 255, np.ones((5, 5), np.uint8)) > 0
+        touch_bnd = tmask & (~t_er)
+        n_oc, oc_lbl, oc_stats, _ = cv2.connectedComponentsWithStats(occ_in.astype(np.uint8), connectivity=8)
+        if n_oc > 1:
+            strong_ev = (dab_s > 26.0) | tex_destroyed | ((~self._occ_is_color) & (dL_s > 26.0))
+            flat_o = oc_lbl.ravel()
+            bnd_hits = np.bincount(flat_o, weights=touch_bnd.ravel().astype(np.float32), minlength=n_oc)
+            strong_hits = np.bincount(flat_o, weights=strong_ev.ravel().astype(np.float32), minlength=n_oc)
+            keep_o = np.zeros(n_oc, dtype=bool)
+            for lbl in range(1, n_oc):
+                area = int(oc_stats[lbl, cv2.CC_STAT_AREA])
+                if bnd_hits[lbl] >= 2 and area >= 12:
+                    keep_o[lbl] = True
+                elif area >= 36 and strong_hits[lbl] >= 18:
+                    keep_o[lbl] = True
+            occ_clean = keep_o[oc_lbl]
+        else:
+            occ_clean = occ_in
+
+        occ_crop = occ_clean[pad:-pad, pad:-pad]
         occ_u8 = np.where(occ_crop, np.uint8(255), np.uint8(0))
         occ_u8 = cv2.morphologyEx(occ_u8, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
         occ_u8 = cv2.morphologyEx(occ_u8, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
 
-        # Export detected 2D occluder mask back to native image coordinates so 2D KLT/RANSAC ignores occluders
-        if int(np.count_nonzero(occ_u8)) >= 64:
-            try:
-                H_c2img = H.astype(np.float64) @ np.linalg.inv(self._occ_H_ref_to_canon)
-                # Offset canonical crop (pad..pad+sz) back to full canonical frame (0..full)
-                T_pad = np.array([[1.0, 0.0, float(pad)], [0.0, 1.0, float(pad)], [0.0, 0.0, 1.0]], dtype=np.float64)
-                H_crop2img = H_c2img @ T_pad
-                fh, fw = frame_bgr.shape[:2]
-                self.last_occluder_mask_img = cv2.warpPerspective(
-                    occ_u8, H_crop2img, (fw, fh), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0
-                )
-            except np.linalg.LinAlgError:
-                self.last_occluder_mask_img = None
-
         vis_cur = (255 - occ_u8).astype(np.float32)
 
-        # Asymmetric zero-lag temporal hysteresis: instant zero on occlusion, smooth only on re-appearance
+        # Asymmetric zero-lag temporal hysteresis: instant zero on occlusion, crisp recovery on exit
         if self._occ_prev_vis is not None and self._occ_prev_vis.shape == vis_cur.shape:
-            vis_f = np.minimum(vis_cur, 0.72 * vis_cur + 0.28 * self._occ_prev_vis)
+            vis_f = np.minimum(vis_cur, 0.85 * vis_cur + 0.15 * self._occ_prev_vis)
         else:
             vis_f = vis_cur
         self._occ_prev_vis = vis_f
         vis_u8 = np.clip(vis_f, 0.0, 255.0).astype(np.uint8)
         vis_u8[vis_u8 < 32] = 0
+        vis_u8[vis_u8 >= 190] = 255
+        occ_soft_u8 = (255 - vis_u8).astype(np.uint8)
 
-        if self._occ_cyl_map_x is not None and self._occ_cyl_map_y is not None:
-            vis_u8 = cv2.remap(vis_u8, self._occ_cyl_map_x, self._occ_cyl_map_y, cv2.INTER_LINEAR)
-            vis_u8[vis_u8 < 32] = 0
+        # Store native-space warp matrix and export occluder mask for tracker + guided-filter compositing
+        self._last_2d_occ_u8 = occ_soft_u8 if int(np.count_nonzero(occ_soft_u8 > 16)) >= 12 else None
+        self._last_2d_H_crop2img: np.ndarray | None = None
+        if self._last_2d_occ_u8 is not None:
+            try:
+                H_c2img = H.astype(np.float64) @ np.linalg.inv(self._occ_H_ref_to_canon)
+                T_pad = np.array([[1.0, 0.0, float(pad)], [0.0, 1.0, float(pad)], [0.0, 0.0, 1.0]], dtype=np.float64)
+                H_crop2img = H_c2img @ T_pad
+                self._last_2d_H_crop2img = H_crop2img
+                if int(np.count_nonzero(occ_u8)) >= 64:
+                    fh, fw = frame_bgr.shape[:2]
+                    self.last_occluder_mask_img = cv2.warpPerspective(
+                        occ_u8, H_crop2img, (fw, fh), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0
+                    )
+            except np.linalg.LinAlgError:
+                self._last_2d_occ_u8 = None
+                self._last_2d_H_crop2img = None
+                self.last_occluder_mask_img = None
 
-        tex_h, tex_w = self._base_alpha_u8.shape
-        vis_tex = cv2.resize(vis_u8, (tex_w, tex_h), interpolation=cv2.INTER_NEAREST)
-        self._work_rgba[:, :, 3] = cv2.multiply(self._base_alpha_u8, vis_tex, scale=1.0 / 255.0)
-        return self._work_rgba
+        # Return full-res clean texture for rasterization; native-space guided-filter occlusion
+        # refinement is applied in composite() for crisp, non-staircased edges!
+        return self._placed_rgba
 
     def _is_in_6dof_target_color(self, bgr_img: np.ndarray) -> np.ndarray:
         """Return bool mask of pixels whose (L, a, b) color falls in the dilated frame-0 target color LUT."""
@@ -614,7 +814,7 @@ class SurfaceCompositor:
         tvec: np.ndarray,
         intr: tuple[float, float, float, float],
     ) -> np.ndarray:
-        """3D-projected UV reference-appearance occlusion mask for mesh_6dof with Birchfield-Tomasi edge tolerance."""
+        """3D-projected UV reference-appearance occlusion mask for mesh_6dof with 5x5 Birchfield-Tomasi & boundary gating."""
         if (
             not self._occ_6dof_enabled
             or self._occ_6dof_uv_pts3d is None
@@ -658,24 +858,35 @@ class SurfaceCompositor:
             raw_d = np.abs(cv_ - rv)
             inl = raw_d <= max(float(np.median(raw_d)), 12.0)
             gain = float(np.clip(float(rv[inl].mean()) / max(float(cv_[inl].mean()), 10.0), 0.65, 1.55)) if int(np.count_nonzero(inl)) >= 24 else 1.0
+            self._last_6dof_gain = gain
             cur_L_n = np.clip(cur_L * gain, 0.0, 255.0)
-            # 3x3 Birchfield-Tomasi distance absorbs 1-2 texel rotational pose shifts without eroding sharp labels
+            # 5x5 Birchfield-Tomasi distance absorbs 1-2 texel rotational pose shifts without eroding sharp labels/text
             dL_bt = np.maximum(0.0, np.maximum(self._occ_6dof_ref_uv_L_min - cur_L_n, cur_L_n - self._occ_6dof_ref_uv_L_max))
             dab_bt_v = np.maximum(0.0, np.maximum(self._occ_6dof_ref_uv_ab_min - cur_ab, cur_ab - self._occ_6dof_ref_uv_ab_max))
             dL = cv2.GaussianBlur(dL_bt, (3, 3), 0.0)
             dab = cv2.GaussianBlur(np.hypot(dab_bt_v[:, :, 0], dab_bt_v[:, :, 1]), (3, 3), 0.0)
-            occ_uv = overlap & ((dab > 26.0) | ((dL > 26.0) & (dab > 12.0)) | ((~self._occ_6dof_is_color) & (dL > 34.0)))
+            raw_occ = overlap & ((dab > 34.0) | ((dL > 32.0) & (dab > 16.0)) | ((~self._occ_6dof_is_color) & (dL > 36.0)))
 
-        # Also cut out explicit non-target skin pixels on front hemisphere (even on newly revealed backside!)
-        # Disabled when the target object itself is predominantly skin/tan-colored (ref_skin_frac >= 0.45).
-        if (
-            self._occ_6dof_is_color
-            and self._occ_6dof_ref_skin_frac < 0.45
-            and self.occlusion_mode in ("ref_plus_boundary", "full")
-        ):
-            skin_uv = _skin_prob_bgr(cur_uv_bgr)
-            in_target_color = self._is_in_6dof_target_color(cur_uv_bgr)
-            occ_uv |= front & (skin_uv > 0.42) & (~in_target_color)
+            # Real foreground occluders (hands, fingers, bars, neighboring bottles) enter from the silhouette
+            # boundary. Filtering out isolated interior patches eliminates popping Swiss-cheese holes over
+            # shifted printed text (e.g. AKAC, TANGY BBQ) and specular highlights!
+            if np.any(raw_occ):
+                front_u8 = front.astype(np.uint8) * 255
+                front_er = cv2.erode(front_u8, np.ones((5, 5), np.uint8)) > 0
+                front_bnd = front & (~front_er)
+                # Top/bottom rows of UV cylinder are also physical silhouette boundaries
+                front_bnd[0:2, :] = True
+                front_bnd[-2:, :] = True
+                n_oc, oc_lbl, oc_stats, _ = cv2.connectedComponentsWithStats(raw_occ.astype(np.uint8), connectivity=8)
+                if n_oc > 1:
+                    flat_o = oc_lbl.ravel()
+                    bnd_hits = np.bincount(flat_o, weights=front_bnd.ravel().astype(np.float32), minlength=n_oc)
+                    keep_o = np.zeros(n_oc, dtype=bool)
+                    for lbl in range(1, n_oc):
+                        area = int(oc_stats[lbl, cv2.CC_STAT_AREA])
+                        if bnd_hits[lbl] >= 2 and area >= 28:
+                            keep_o[lbl] = True
+                    occ_uv = keep_o[oc_lbl]
 
         occ_u8 = np.where(occ_uv, np.uint8(255), np.uint8(0))
         occ_u8 = cv2.morphologyEx(occ_u8, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
@@ -690,7 +901,7 @@ class SurfaceCompositor:
         vis_u8[vis_u8 < 32] = 0
 
         tex_h, tex_w = self._base_alpha_u8.shape
-        vis_tex = cv2.resize(vis_u8, (tex_w, tex_h), interpolation=cv2.INTER_NEAREST)
+        vis_tex = cv2.resize(vis_u8, (tex_w, tex_h), interpolation=cv2.INTER_LINEAR)
         self._work_rgba[:, :, 3] = cv2.multiply(self._base_alpha_u8, vis_tex, scale=1.0 / 255.0)
         return self._work_rgba
 
@@ -698,13 +909,21 @@ class SurfaceCompositor:
         self,
         frame_bgr: np.ndarray,
         sil_mask: np.ndarray,
+        *,
+        depth_buf: np.ndarray | None = None,
+        rvec: np.ndarray | None = None,
+        tvec: np.ndarray | None = None,
+        intr: tuple[float, float, float, float] | None = None,
     ) -> np.ndarray | None:
-        """Detect exterior-connected hands/fingers AND non-target background rim overhang on projected 3D silhouettes."""
-        if not self._occ_6dof_enabled or not self._occ_6dof_is_color:
-            return None
-        if self._occ_6dof_ref_skin_frac >= 0.45:
+        """Detect exterior-connected hands/occluders & non-target rim overhang with guided-filter edge snapping.
+
+        Returns HxW uint8 soft alpha mask (0..255) for smooth edge-aligned compositing.
+        """
+        if not self._occ_6dof_enabled:
             return None
         if self.occlusion_mode not in ("ref_plus_boundary", "full"):
+            return None
+        if self._occ_6dof_is_color and self._occ_6dof_ref_skin_frac >= 0.45:
             return None
         ys, xs = np.nonzero(sil_mask)
         if len(xs) < 64:
@@ -716,85 +935,164 @@ class SurfaceCompositor:
         x1 = min(w, int(xs.max()) + pad + 1)
         y1 = min(h, int(ys.max()) + pad + 1)
 
-        roi_bgr = frame_bgr[y0:y1:2, x0:x1:2]
+        roi_bgr_full = frame_bgr[y0:y1, x0:x1]
+        roi_bgr = roi_bgr_full[::2, ::2]
         roi_sil = sil_mask[y0:y1:2, x0:x1:2] > 0
         n_sil_px = int(np.count_nonzero(roi_sil))
         if n_sil_px < 16:
             return None
         ext = ~roi_sil
-        in_target_color = self._is_in_6dof_target_color(roi_bgr)
         occ_roi = np.zeros(roi_sil.shape, dtype=bool)
+        hand_only_roi = np.zeros(roi_sil.shape, dtype=bool)
         sil_u8_roi = roi_sil.astype(np.uint8) * 255
         sil_core = cv2.erode(sil_u8_roi, np.ones((3, 3), np.uint8), iterations=1) > 0
 
-        # 1. Exterior-connected gripping hands/fingers that penetrate inside the silhouette core
-        # (prevents warm wooden tabletops merely grazing the silhouette exterior from triggering false hand masks!)
-        skin = _skin_prob_bgr(roi_bgr)
-        skin_cand = (skin > 0.32) & (~(roi_sil & in_target_color))
-        skin_bin = cv2.morphologyEx(skin_cand.astype(np.uint8), cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
-        n_cc, labels, _, _ = cv2.connectedComponentsWithStats(skin_bin, connectivity=8)
-        if n_cc > 1:
-            flat = labels.ravel()
-            ext_cnt = np.bincount(flat, weights=ext.ravel().astype(np.float32), minlength=n_cc)
-            in_cnt = np.bincount(flat, weights=roi_sil.ravel().astype(np.float32), minlength=n_cc)
-            core_cnt = np.bincount(flat, weights=sil_core.ravel().astype(np.float32), minlength=n_cc)
-            keep = np.zeros(n_cc, dtype=bool)
-            for lbl in range(1, n_cc):
-                if ext_cnt[lbl] >= 9 and in_cnt[lbl] >= 6 and core_cnt[lbl] >= 2:
-                    keep[lbl] = True
-            if np.any(keep):
-                hand_core = keep[labels].astype(np.uint8) * 255
-                hand_dil = cv2.dilate(hand_core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))) > 0
-                hand_halo = (cv2.dilate(hand_core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))) > 0) & (skin > 0.18) & (~in_target_color)
-                hand_in_sil = (hand_dil | hand_halo) & roi_sil
-                if int(np.count_nonzero(hand_in_sil)) <= int(0.60 * max(n_sil_px, 1)):
-                    occ_roi |= hand_in_sil
+        # Exact per-pixel 3D depth -> cylinder UV reference-match protection:
+        # Any pixel inside the silhouette whose current Lab color STILL MATCHES its verified frame-0
+        # baked UV appearance (e.g. red/white paper label on blue pitcher or orange bottom band on soup can)
+        # is unequivocally the object itself and must NEVER be masked out as a hand or background!
+        uv_matches_ref = np.zeros(roi_sil.shape, dtype=bool)
+        if (
+            depth_buf is not None
+            and rvec is not None
+            and tvec is not None
+            and intr is not None
+            and self._occ_6dof_ref_uv_valid is not None
+            and self._occ_6dof_ref_uv_L_min is not None
+            and self._occ_6dof_ref_uv_L_max is not None
+            and self._occ_6dof_ref_uv_ab_min is not None
+            and self._occ_6dof_ref_uv_ab_max is not None
+        ):
+            roi_z = depth_buf[y0:y1:2, x0:x1:2]
+            valid_z = roi_sil & np.isfinite(roi_z) & (roi_z > 0.03) & (roi_z < 100.0)
+            if np.any(valid_z):
+                ry_i, rx_i = np.nonzero(valid_z)
+                fx, fy, cx, cy = intr
+                px_img = (x0 + 2 * rx_i).astype(np.float64)
+                py_img = (y0 + 2 * ry_i).astype(np.float64)
+                z_v = roi_z[ry_i, rx_i].astype(np.float64)
+                p_cam = np.column_stack([
+                    (px_img - cx) * z_v / fx,
+                    (py_img - cy) * z_v / fy,
+                    z_v,
+                ])
+                R_m, _ = cv2.Rodrigues(rvec.astype(np.float64).reshape(3))
+                t_m = tvec.astype(np.float64).reshape(1, 3)
+                p_obj = (p_cam - t_m) @ R_m
+                theta = np.arctan2(p_obj[:, 0], -p_obj[:, 2])
+                u_f = theta / (2.0 * math.pi) + 0.5
+                v_f = (p_obj[:, 1] - self._occ_6dof_y_min) / self._occ_6dof_cyl_h
+                vh, uw = self._occ_6dof_ref_uv_valid.shape
+                iu = np.clip(np.round(u_f * (uw - 1)).astype(np.int32), 0, uw - 1)
+                iv = np.clip(np.round(v_f * (vh - 1)).astype(np.int32), 0, vh - 1)
+                in_ref = self._occ_6dof_ref_uv_valid[iv, iu]
+                if np.any(in_ref):
+                    roi_lab_f = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+                    cL = np.clip(roi_lab_f[ry_i, rx_i, 0] * float(getattr(self, "_last_6dof_gain", 1.0)), 0.0, 255.0)
+                    cab = roi_lab_f[ry_i, rx_i, 1:3]
+                    dL_p = np.maximum(
+                        0.0,
+                        np.maximum(self._occ_6dof_ref_uv_L_min[iv, iu] - cL, cL - self._occ_6dof_ref_uv_L_max[iv, iu]),
+                    )
+                    dab_v = np.maximum(
+                        0.0,
+                        np.maximum(self._occ_6dof_ref_uv_ab_min[iv, iu] - cab, cab - self._occ_6dof_ref_uv_ab_max[iv, iu]),
+                    )
+                    dab_p = np.hypot(dab_v[:, 0], dab_v[:, 1])
+                    matched = in_ref & (dL_p < 22.0) & (dab_p < 18.0)
+                    uv_matches_ref[ry_i[matched], rx_i[matched]] = True
 
-        # 2. Exterior-connected non-target background rim trim (strictly outer rim band — never erodes object interior!)
-        # Require pixels to be NOT in target Lab LUT AND to match the immediate exterior ring's Lab color
-        # so newly revealed textures on spinning objects are NEVER falsely trimmed!
-        hand_only_roi = occ_roi.copy()
-        if self._occ_6dof_target_lab_lut is not None:
-            sil_w_roi = max(1, int(xs.max() - xs.min() + 1))
-            rim_k = min(13, max(7, int(round(0.11 * sil_w_roi)) | 1))
-            k_rim = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (rim_k, rim_k))
-            interior = cv2.erode(sil_u8_roi, k_rim) > 0
-            ext_ring = (cv2.dilate(sil_u8_roi, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))) > 0) & ext
-            if int(np.count_nonzero(ext_ring)) >= 10:
-                roi_lab_u8 = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2LAB)
-                bg_pts = roi_lab_u8[ext_ring]
-                # Only treat exterior color bins that occupy >= 3% of the exterior ring as true background
-                bg_cnt = np.zeros((12, 23, 23), dtype=np.int32)
-                np.add.at(
-                    bg_cnt,
-                    (
-                        np.clip(bg_pts[:, 0] // 24, 0, 11),
-                        np.clip(bg_pts[:, 1] // 12, 0, 22),
-                        np.clip(bg_pts[:, 2] // 12, 0, 22),
-                    ),
-                    1,
-                )
-                bg_lut = bg_cnt >= max(4, int(0.03 * len(bg_pts)))
-                in_bg_color = bg_lut[
-                    np.clip(roi_lab_u8[:, :, 0] // 24, 0, 11),
-                    np.clip(roi_lab_u8[:, :, 1] // 12, 0, 22),
-                    np.clip(roi_lab_u8[:, :, 2] // 12, 0, 22),
-                ]
-                allowed_trim = ext | (roi_sil & (~interior))
-                non_target_rim = allowed_trim & (~in_target_color) & (ext | in_bg_color)
-                n_bg, bg_lbl, _, _ = cv2.connectedComponentsWithStats(non_target_rim.astype(np.uint8), connectivity=4)
-                if n_bg > 1:
-                    flat_b = bg_lbl.ravel()
-                    b_ext = np.bincount(flat_b, weights=ext.ravel().astype(np.float32), minlength=n_bg)
-                    b_in = np.bincount(flat_b, weights=(roi_sil & (~interior)).ravel().astype(np.float32), minlength=n_bg)
-                    keep_bg = np.zeros(n_bg, dtype=bool)
-                    for lbl in range(1, n_bg):
-                        if b_ext[lbl] >= 9 and b_in[lbl] >= 3:
-                            keep_bg[lbl] = True
-                    if np.any(keep_bg):
-                        rim_occ = keep_bg[bg_lbl] & roi_sil
-                        rim_occ = cv2.dilate(rim_occ.astype(np.uint8) * 255, np.ones((3, 3), np.uint8)) > 0
-                        occ_roi |= rim_occ & roi_sil
+        if self._occ_6dof_is_color:
+            in_target_color = self._is_in_6dof_target_color(roi_bgr) | uv_matches_ref
+
+            # 1. Exterior-connected gripping hands/fingers that penetrate inside the silhouette core
+            skin = _skin_prob_bgr(roi_bgr)
+            skin_cand = (skin > 0.32) & (~(roi_sil & in_target_color))
+            skin_bin = cv2.morphologyEx(skin_cand.astype(np.uint8), cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+            n_cc, labels, _, _ = cv2.connectedComponentsWithStats(skin_bin, connectivity=8)
+            if n_cc > 1:
+                flat = labels.ravel()
+                ext_cnt = np.bincount(flat, weights=ext.ravel().astype(np.float32), minlength=n_cc)
+                in_cnt = np.bincount(flat, weights=roi_sil.ravel().astype(np.float32), minlength=n_cc)
+                core_cnt = np.bincount(flat, weights=sil_core.ravel().astype(np.float32), minlength=n_cc)
+                keep = np.zeros(n_cc, dtype=bool)
+                for lbl in range(1, n_cc):
+                    if ext_cnt[lbl] >= 9 and in_cnt[lbl] >= 6 and core_cnt[lbl] >= 2:
+                        keep[lbl] = True
+                if np.any(keep):
+                    hand_core = keep[labels].astype(np.uint8) * 255
+                    hand_dil = cv2.dilate(hand_core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))) > 0
+                    hand_halo = (cv2.dilate(hand_core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))) > 0) & (skin > 0.18) & (~in_target_color)
+                    hand_in_sil = (hand_dil | hand_halo) & roi_sil & (~uv_matches_ref)
+                    if int(np.count_nonzero(hand_in_sil)) <= int(0.60 * max(n_sil_px, 1)):
+                        occ_roi |= hand_in_sil
+                        hand_only_roi |= hand_in_sil
+
+            # 2. Exterior-connected non-target background / foreground-neighbor trim (e.g., adjacent yellow mustard
+            # bottle overlapping blue pitcher or dark desk visible through handle air-gap).
+            if self._occ_6dof_target_lab_lut is not None:
+                sil_w_roi = max(1, int(xs.max() - xs.min() + 1))
+                rim_k = min(31, max(7, int(round(0.24 * sil_w_roi)) | 1))
+                k_rim = cv2.getStructuringElement(cv2.MORPH_RECT, (rim_k, rim_k))
+                interior = cv2.erode(sil_u8_roi, k_rim) > 0
+                ext_ring = (cv2.dilate(sil_u8_roi, cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))) > 0) & ext
+                if int(np.count_nonzero(ext_ring)) >= 10:
+                    roi_lab_u8 = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2LAB)
+                    bg_pts = roi_lab_u8[ext_ring]
+                    bg_cnt = np.zeros((12, 23, 23), dtype=np.int32)
+                    np.add.at(
+                        bg_cnt,
+                        (
+                            np.clip(bg_pts[:, 0] // 24, 0, 11),
+                            np.clip(bg_pts[:, 1] // 12, 0, 22),
+                            np.clip(bg_pts[:, 2] // 12, 0, 22),
+                        ),
+                        1,
+                    )
+                    bg_lut = bg_cnt >= max(4, int(0.025 * len(bg_pts)))
+                    in_bg_color = bg_lut[
+                        np.clip(roi_lab_u8[:, :, 0] // 24, 0, 11),
+                        np.clip(roi_lab_u8[:, :, 1] // 12, 0, 22),
+                        np.clip(roi_lab_u8[:, :, 2] // 12, 0, 22),
+                    ]
+                    allowed_trim = ext | (roi_sil & (~interior))
+                    non_target_rim = allowed_trim & (~in_target_color) & (ext | in_bg_color)
+                    n_bg, bg_lbl, _, _ = cv2.connectedComponentsWithStats(non_target_rim.astype(np.uint8), connectivity=4)
+                    if n_bg > 1:
+                        flat_b = bg_lbl.ravel()
+                        b_ext = np.bincount(flat_b, weights=ext.ravel().astype(np.float32), minlength=n_bg)
+                        b_in = np.bincount(flat_b, weights=(roi_sil & (~interior)).ravel().astype(np.float32), minlength=n_bg)
+                        keep_bg = np.zeros(n_bg, dtype=bool)
+                        for lbl in range(1, n_bg):
+                            if b_ext[lbl] >= 9 and b_in[lbl] >= 3:
+                                keep_bg[lbl] = True
+                        if np.any(keep_bg):
+                            rim_occ = keep_bg[bg_lbl] & roi_sil
+                            rim_occ = cv2.dilate(rim_occ.astype(np.uint8) * 255, np.ones((3, 3), np.uint8)) > 0
+                            occ_roi |= rim_occ & roi_sil & (~uv_matches_ref)
+        else:
+            # Grayscale/monochrome exterior-connected hand/occluder trim (e.g. darker fingers gripping a bright mug)
+            roi_gray_s = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            l_lo = self._occ_6dof_ref_L_lo - 10.0
+            l_hi = self._occ_6dof_ref_L_hi + 10.0
+            # Only apply when target object has a reasonably coherent intensity band (not full 0..255 span)
+            if (self._occ_6dof_ref_L_hi - self._occ_6dof_ref_L_lo) < 110.0:
+                non_target_L = (roi_gray_s < l_lo) | (roi_gray_s > l_hi)
+                cand = cv2.morphologyEx(non_target_L.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+                n_cc, labels, _, _ = cv2.connectedComponentsWithStats(cand, connectivity=8)
+                if n_cc > 1:
+                    flat = labels.ravel()
+                    ext_cnt = np.bincount(flat, weights=ext.ravel().astype(np.float32), minlength=n_cc)
+                    in_cnt = np.bincount(flat, weights=roi_sil.ravel().astype(np.float32), minlength=n_cc)
+                    keep = np.zeros(n_cc, dtype=bool)
+                    for lbl in range(1, n_cc):
+                        if ext_cnt[lbl] >= 12 and in_cnt[lbl] >= 6:
+                            keep[lbl] = True
+                    if np.any(keep):
+                        mono_occ = keep[labels] & roi_sil
+                        if int(np.count_nonzero(mono_occ)) <= int(0.70 * max(n_sil_px, 1)):
+                            occ_roi |= mono_occ
+                            hand_only_roi |= mono_occ
 
         roi_w, roi_h = x1 - x0, y1 - y0
         self._last_6dof_hand_only_mask: np.ndarray | None = None
@@ -809,12 +1107,25 @@ class SurfaceCompositor:
 
         if not np.any(occ_roi):
             return None
-        full_occ = np.zeros((h, w), dtype=np.uint8)
-        full_occ[y0:y1, x0:x1] = cv2.resize(
-            np.where(occ_roi, np.uint8(255), np.uint8(0)),
+
+        # Mark exterior pixels outside roi_sil as 1.0 BEFORE guided filtering so the filter never averages
+        # down to 0.5 along the outer mesh border (eliminating floating 1-px white outline fringes!),
+        # then clip back to full-res silhouette.
+        occ_for_guide = (occ_roi | (~roi_sil)).astype(np.float32)
+        occ_up = cv2.resize(
+            occ_for_guide,
             (roi_w, roi_h),
-            interpolation=cv2.INTER_NEAREST,
+            interpolation=cv2.INTER_LINEAR,
         )
+        roi_gray_full = cv2.cvtColor(roi_bgr_full, cv2.COLOR_BGR2GRAY)
+        occ_alpha = _guided_filter_alpha(roi_gray_full, occ_up, radius=4, eps=0.012)
+        occ_alpha = np.clip((occ_alpha - 0.18) / 0.64, 0.0, 1.0)
+        # Ensure pixels strictly outside sil_mask stay 0 in the returned mask
+        roi_sil_full = sil_mask[y0:y1, x0:x1] > 0
+        occ_alpha = np.where(roi_sil_full, occ_alpha, 0.0)
+        full_occ = np.zeros((h, w), dtype=np.uint8)
+        full_occ[y0:y1, x0:x1] = np.clip(occ_alpha * 255.0, 0.0, 255.0).astype(np.uint8)
+        self._last_6dof_occ_roi = (x0, y0, x1, y1)
         return full_occ
 
     @staticmethod
@@ -841,12 +1152,7 @@ class SurfaceCompositor:
         rows: int,
         radius_frac: float,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Build cylindrical foreshortening mesh in reference bbox coordinates.
-
-        Maps angular arc theta in [-max_angle, +max_angle] onto x_frac = 0.5 + 0.5 * sin(theta)/sin(max_angle),
-        while texture u advances linearly with arc-length theta — creating authentic curved foreshortening
-        around mugs, bottles, and cans.
-        """
+        """Build cylindrical foreshortening mesh in reference bbox (or oriented cylinder) coordinates."""
         bx, by, bw, bh = self.ref_bbox
         # Clamp angular sweep based on cylinder_radius_frac
         half_arc = math.radians(min(82.0, max(35.0, 74.0 * math.sqrt(max(0.15, radius_frac) / 0.5))))
@@ -859,16 +1165,30 @@ class SurfaceCompositor:
 
         ref_xy: list[list[float]] = []
         uvs: list[list[float]] = []
-        # Subtle vertical curvature bow along top/bottom of cylinder silhouette
-        bow = 0.035 * float(bh) * min(1.5, max(0.3, radius_frac / 0.5))
-        for v in v_vals:
-            v_centered = (float(v) - 0.5) * 2.0  # -1 at top, +1 at bottom
-            for i, xf in enumerate(x_fracs):
-                cos_t = math.cos(float(thetas[i]))
-                px = float(bx) + float(xf) * float(bw)
-                py = float(by) + float(v) * float(bh) + bow * (cos_t - math.cos(half_arc)) * (0.4 + 0.6 * abs(v_centered))
-                ref_xy.append([px, py])
-                uvs.append([float(u_vals[i]), float(v)])
+        if self._cyl_oriented is not None:
+            (ocx, ocy), ow, oh, oang = self._cyl_oriented
+            ca, sa = math.cos(oang), math.sin(oang)
+            bow = 0.035 * float(oh) * min(1.5, max(0.3, radius_frac / 0.5))
+            for v in v_vals:
+                v_centered = (float(v) - 0.5) * 2.0
+                for i, xf in enumerate(x_fracs):
+                    cos_t = math.cos(float(thetas[i]))
+                    lx = (float(xf) - 0.5) * float(ow)
+                    ly = (float(v) - 0.5) * float(oh) + bow * (cos_t - math.cos(half_arc)) * (0.4 + 0.6 * abs(v_centered))
+                    px = ocx + lx * ca - ly * sa
+                    py = ocy + lx * sa + ly * ca
+                    ref_xy.append([px, py])
+                    uvs.append([float(u_vals[i]), float(v)])
+        else:
+            bow = 0.035 * float(bh) * min(1.5, max(0.3, radius_frac / 0.5))
+            for v in v_vals:
+                v_centered = (float(v) - 0.5) * 2.0  # -1 at top, +1 at bottom
+                for i, xf in enumerate(x_fracs):
+                    cos_t = math.cos(float(thetas[i]))
+                    px = float(bx) + float(xf) * float(bw)
+                    py = float(by) + float(v) * float(bh) + bow * (cos_t - math.cos(half_arc)) * (0.4 + 0.6 * abs(v_centered))
+                    ref_xy.append([px, py])
+                    uvs.append([float(u_vals[i]), float(v)])
 
         tris: list[list[int]] = []
         stride = cols + 1
@@ -921,10 +1241,15 @@ class SurfaceCompositor:
         self,
         frame_bgr: np.ndarray,
         track_result: TrackFrameResult,
+        *,
+        external_fg_mask: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray | None, float]:
         """Composite artwork onto `frame_bgr` if `track_result.state == 'tracking'`.
 
         Strictly suppresses overlay (returns untouched frame) when state != 'tracking'.
+        When `external_fg_mask` (HxW uint8 foreground mask from neural VOS) is provided,
+        bypasses heuristic occlusion carving and intersects the rasterized artwork cleanly
+        with an edge-snapped Fast Guided Filter matte of the live VOS foreground mask.
         Returns `(out_bgr, rendered_mask_or_None, composite_ms)`.
         """
         t0 = time.perf_counter()
@@ -936,13 +1261,22 @@ class SurfaceCompositor:
             self._occ_prev_vis = None
             self._occ_prev_L_half = None
             self._occ_6dof_prev_vis_uv = None
+            self._last_2d_occ_u8 = None
+            self._last_2d_H_crop2img = None
             self.last_occluder_mask_img = None
             return frame_bgr, None, (time.perf_counter() - t0) * 1000.0
 
         h, w = frame_bgr.shape[:2]
+        use_vos = external_fg_mask is not None and external_fg_mask.shape == (h, w)
+        if use_vos and int(np.count_nonzero(external_fg_mask)) < 32:
+            self.last_occluder_mask_img = None
+            return frame_bgr, None, (time.perf_counter() - t0) * 1000.0
+
         depth_buf, mask_buf = self._ensure_buffers(h, w)
         mode = self.placement.wrap_mode
         self.last_occluder_mask_img = None
+        self._last_2d_occ_u8 = None
+        self._last_2d_H_crop2img = None
 
         if mode == "mesh_6dof":
             if (
@@ -963,14 +1297,29 @@ class SurfaceCompositor:
                 f = float(max(w, h)) * 0.9
                 fx, fy, cx, cy = f, f, w * 0.5, h * 0.5
             triangles = self.mesh.triangles
+            # Backface culling for closed/curved 3D meshes: prevents inside back-wall triangles from
+            # painting across open cylinder top lids or bleeding through front occlusion holes!
+            if self.mesh.name != "plane" and len(triangles) > 0 and len(self.mesh.normals) == len(self.mesh.vertices):
+                norms_cam = self.mesh.normals.astype(np.float64) @ R.T
+                t_norms = norms_cam[triangles].mean(axis=1)
+                t_cent = verts_cam[triangles].astype(np.float64).mean(axis=1)
+                c_len = np.maximum(np.linalg.norm(t_cent, axis=1), 1e-6)
+                n_len = np.maximum(np.linalg.norm(t_norms, axis=1), 1e-6)
+                facing = np.sum(t_norms * (-t_cent), axis=1) / (c_len * n_len)
+                front_tris = triangles[facing > 0.04]
+                if len(front_tris) > 0:
+                    triangles = np.ascontiguousarray(front_tris, dtype=np.int32)
             uvs = self.mesh.uvs
             intr = (fx, fy, cx, cy)
             wrap_repeat = self.placement.tile_repeat
-            tex_rgba = (
-                self._apply_6dof_uv_occlusion(frame_bgr, track_result.pose_rvec, track_result.pose_tvec, intr)
-                if self._occ_6dof_enabled
-                else self._placed_rgba
-            )
+            if use_vos:
+                tex_rgba = self._placed_rgba
+            else:
+                tex_rgba = (
+                    self._apply_6dof_uv_occlusion(frame_bgr, track_result.pose_rvec, track_result.pose_tvec, intr)
+                    if self._occ_6dof_enabled
+                    else self._placed_rgba
+                )
         else:
             if track_result.homography_3x3 is None:
                 return frame_bgr, None, (time.perf_counter() - t0) * 1000.0
@@ -990,16 +1339,13 @@ class SurfaceCompositor:
                 uvs = self._cyl_uvs
             elif mode == "mesh_grid":
                 if track_result.grid_dst_pts is not None and len(track_result.grid_dst_pts) == len(self._grid_uvs):
-                    # Subtle pillow-grid wave modulation + tracked grid points
                     dst_xy = track_result.grid_dst_pts.astype(np.float64)
-                    # Lift grid via homography W for perspective correctness while honoring grid_dst_pts
                     ref_xy = track_result.grid_src_pts.astype(np.float64) if track_result.grid_src_pts is not None else np.column_stack([bx + self._grid_uvs[:, 0] * bw, by + self._grid_uvs[:, 1] * bh])
                     ones = np.ones((len(ref_xy), 1), dtype=np.float64)
                     w_vals = (np.hstack([ref_xy, ones]) @ H.astype(np.float64).T)[:, 2]
                     if float(np.median(w_vals)) < 0.0:
                         w_vals = -w_vals
                     w_vals = np.maximum(w_vals, 1e-3)
-                    # Add gentle smooth radial UV dome warp distinct from flat planar
                     u_c = self._grid_uvs[:, 0] - 0.5
                     v_c = self._grid_uvs[:, 1] - 0.5
                     r2 = u_c * u_c + v_c * v_c
@@ -1024,7 +1370,20 @@ class SurfaceCompositor:
 
             intr = (1.0, 1.0, 0.0, 0.0)
             wrap_repeat = False  # Placement/repeat already baked into _placed_rgba
-            tex_rgba = self._apply_local_occlusion_mask(frame_bgr, H) if self._occ_enabled else self._placed_rgba
+            if use_vos:
+                if self._placed_rgba_unclipped is None:
+                    self._placed_rgba_unclipped = _prepare_placed_texture(
+                        self._artwork_rgba,
+                        self.placement,
+                        surface_mask_crop=None,
+                    )
+                tex_rgba = self._placed_rgba_unclipped
+                # On color planar surfaces, also run fast local texture-destruction check to catch
+                # same-color foreground bars that split the card and can cause VOS bridging.
+                if mode == "planar" and self._occ_enabled and self._occ_is_color:
+                    self._apply_local_occlusion_mask(frame_bgr, H)
+            else:
+                tex_rgba = self._apply_local_occlusion_mask(frame_bgr, H) if self._occ_enabled else self._placed_rgba
 
         frame_rgb = np.ascontiguousarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
         res: RasterizeResult = rasterize_mesh_rgbd(
@@ -1043,14 +1402,119 @@ class SurfaceCompositor:
         )
         out_bgr = cv2.cvtColor(res.frame_rgb, cv2.COLOR_RGB2BGR)
         out_mask = res.mask
+
+        if use_vos and external_fg_mask is not None:
+            ys_m, xs_m = np.nonzero(out_mask > 0)
+            if len(xs_m) < 24:
+                return frame_bgr, None, (time.perf_counter() - t0) * 1000.0
+            pad_r = 10
+            x0 = max(0, int(xs_m.min()) - pad_r)
+            y0 = max(0, int(ys_m.min()) - pad_r)
+            x1 = min(w, int(xs_m.max()) + pad_r + 1)
+            y1 = min(h, int(ys_m.max()) + pad_r + 1)
+            vos_roi = external_fg_mask[y0:y1, x0:x1]
+            if not np.any(vos_roi > 0):
+                return frame_bgr, None, (time.perf_counter() - t0) * 1000.0
+            roi_gray = cv2.cvtColor(frame_bgr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+            vos_alpha = _guided_filter_alpha(
+                roi_gray,
+                vos_roi.astype(np.float32) * (1.0 / 255.0),
+                radius=3,
+                eps=0.006,
+            )
+            vos_alpha = np.clip((vos_alpha - 0.12) / 0.76, 0.0, 1.0)
+            if (
+                mode == "planar"
+                and self._occ_is_color
+                and self._last_2d_occ_u8 is not None
+                and self._last_2d_H_crop2img is not None
+            ):
+                roi_w, roi_h = x1 - x0, y1 - y0
+                T_roi = np.array([[1.0, 0.0, float(-x0)], [0.0, 1.0, float(-y0)], [0.0, 0.0, 1.0]], dtype=np.float64)
+                H_to_roi = T_roi @ self._last_2d_H_crop2img
+                occ_roi_u8 = cv2.warpPerspective(
+                    self._last_2d_occ_u8,
+                    H_to_roi,
+                    (roi_w, roi_h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REPLICATE,
+                    borderValue=0,
+                )
+                if np.any(occ_roi_u8 > 16):
+                    occ_alpha = _guided_filter_alpha(
+                        roi_gray,
+                        occ_roi_u8.astype(np.float32) * (1.0 / 255.0),
+                        radius=4,
+                        eps=0.01,
+                    )
+                    occ_alpha = np.clip((occ_alpha - 0.16) / 0.68, 0.0, 1.0)
+                    vos_alpha = vos_alpha * (1.0 - occ_alpha)
+            a3 = vos_alpha[:, :, None]
+            roi_out = out_bgr[y0:y1, x0:x1].astype(np.float32)
+            roi_src = frame_bgr[y0:y1, x0:x1].astype(np.float32)
+            out_bgr[y0:y1, x0:x1] = np.clip(roi_out * a3 + roi_src * (1.0 - a3), 0.0, 255.0).astype(np.uint8)
+            out_mask = out_mask.copy()
+            out_mask[y0:y1, x0:x1][vos_alpha < 0.45] = 0
+            if int(np.count_nonzero(out_mask)) < 24:
+                return frame_bgr, None, (time.perf_counter() - t0) * 1000.0
+            comp_ms = (time.perf_counter() - t0) * 1000.0
+            return out_bgr, out_mask, comp_ms
+
         if mode == "mesh_6dof" and self._occ_6dof_enabled:
             sil_u8 = (res.depth_buf < 1e20).astype(np.uint8) * 255
-            hand_mask = self._compute_6dof_exterior_hand_mask(frame_bgr, sil_u8)
+            hand_mask = self._compute_6dof_exterior_hand_mask(
+                frame_bgr,
+                sil_u8,
+                depth_buf=res.depth_buf,
+                rvec=track_result.pose_rvec,
+                tvec=track_result.pose_tvec,
+                intr=intr,
+            )
             if hand_mask is not None:
-                occ_b = hand_mask > 0
-                out_bgr[occ_b] = frame_bgr[occ_b]
-                out_mask = out_mask.copy()
-                out_mask[occ_b] = 0
+                x0, y0, x1, y1 = getattr(self, "_last_6dof_occ_roi", (0, 0, w, h))
+                hm_roi = hand_mask[y0:y1, x0:x1]
+                nz = hm_roi > 0
+                if np.any(nz):
+                    a = hm_roi[nz].astype(np.float32)[:, None] * (1.0 / 255.0)
+                    roi_out = out_bgr[y0:y1, x0:x1]
+                    roi_src = frame_bgr[y0:y1, x0:x1]
+                    roi_out[nz] = np.clip(
+                        roi_out[nz].astype(np.float32) * (1.0 - a) + roi_src[nz].astype(np.float32) * a,
+                        0.0,
+                        255.0,
+                    ).astype(np.uint8)
+                    out_mask = out_mask.copy()
+                    out_mask[y0:y1, x0:x1][hm_roi >= 115] = 0
                 self.last_occluder_mask_img = getattr(self, "_last_6dof_hand_only_mask", None)
+            # Sanity gate: suppress shredded floating scraps (< 18% of projected 3D silhouette survived occlusion)
+            n_sil = int(np.count_nonzero(sil_u8))
+            n_ren = int(np.count_nonzero(out_mask))
+            if n_sil >= 400 and n_ren < int(0.18 * n_sil):
+                return frame_bgr, None, (time.perf_counter() - t0) * 1000.0
+        elif mode == "planar" and self._last_2d_occ_u8 is not None and self._last_2d_H_crop2img is not None:
+            ys_m, xs_m = np.nonzero(out_mask > 0)
+            n_pre = len(xs_m)
+            if n_pre >= 32:
+                pad_r = 12
+                x0 = max(0, int(xs_m.min()) - pad_r)
+                y0 = max(0, int(ys_m.min()) - pad_r)
+                x1 = min(w, int(xs_m.max()) + pad_r + 1)
+                y1 = min(h, int(ys_m.max()) + pad_r + 1)
+                roi_w, roi_h = x1 - x0, y1 - y0
+                T_roi = np.array([[1.0, 0.0, float(-x0)], [0.0, 1.0, float(-y0)], [0.0, 0.0, 1.0]], dtype=np.float64)
+                H_to_roi = T_roi @ self._last_2d_H_crop2img
+                occ_roi_u8 = cv2.warpPerspective(
+                    self._last_2d_occ_u8, H_to_roi, (roi_w, roi_h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE, borderValue=0
+                )
+                if np.any(occ_roi_u8 > 16):
+                    roi_gray = cv2.cvtColor(frame_bgr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+                    occ_alpha = _guided_filter_alpha(roi_gray, occ_roi_u8.astype(np.float32) * (1.0 / 255.0), radius=4, eps=0.01)
+                    occ_alpha = np.clip((occ_alpha - 0.16) / 0.68, 0.0, 1.0)
+                    a3 = occ_alpha[:, :, None]
+                    roi_out = out_bgr[y0:y1, x0:x1].astype(np.float32)
+                    roi_src = frame_bgr[y0:y1, x0:x1].astype(np.float32)
+                    out_bgr[y0:y1, x0:x1] = np.clip(roi_out * (1.0 - a3) + roi_src * a3, 0.0, 255.0).astype(np.uint8)
+                    out_mask = out_mask.copy()
+                    out_mask[y0:y1, x0:x1][occ_alpha >= 0.45] = 0
         comp_ms = (time.perf_counter() - t0) * 1000.0
         return out_bgr, out_mask, comp_ms

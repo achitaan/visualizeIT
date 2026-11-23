@@ -250,17 +250,47 @@ def segment_frame(
     work_bgr = frame_bgr[crop_y0:crop_y1, crop_x0:crop_x1]
     ch, cw = work_bgr.shape[:2]
 
-    # Downscale for < 60 ms GrabCut execution on 2 vCPUs (area-capped when ROI-cropped)
-    scale = min(1.0, float(max_work_dim) / float(max(cw, ch)))
-    if sharp_onboarding:
-        max_pixels = int(round(float(max_work_dim) * float(max_work_dim) * 0.62))
-        scale = min(scale, math.sqrt(float(max_pixels) / float(max(cw * ch, 1))))
+    # Downscale for < 60 ms GrabCut execution on 2 vCPUs (area-capped when ROI-cropped).
+    # For small tight crops on monochrome frames (e.g. narrow handheld bottles), keep full crop
+    # resolution so thin object edges are not lost before 3-channel feature GrabCut.
+    small_crop_mono = (
+        sharp_onboarding
+        and explicit_box is not None
+        and (cw * ch) <= 120000
+        and float(np.std(cv2.cvtColor(work_bgr[::2, ::2], cv2.COLOR_BGR2LAB)[:, :, 1:3])) <= 4.0
+    )
+    if small_crop_mono:
+        scale = 1.0
+    else:
+        scale = min(1.0, float(max_work_dim) / float(max(cw, ch)))
+        if sharp_onboarding:
+            max_pixels = int(round(float(max_work_dim) * float(max_work_dim) * 0.62))
+            scale = min(scale, math.sqrt(float(max_pixels) / float(max(cw * ch, 1))))
     sw = max(16, int(round(cw * scale)))
     sh = max(16, int(round(ch * scale)))
     sx = float(sw) / float(cw)
     sy = float(sh) / float(ch)
 
     small_bgr = cv2.resize(work_bgr, (sw, sh), interpolation=cv2.INTER_AREA) if scale < 1.0 else work_bgr
+    small_lab_chk = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    is_mono_frame = float(np.std(small_lab_chk[:, :, 1:3])) <= 4.0
+    if is_mono_frame:
+        # OpenCV GrabCut fits a 3D BGR GMM; on grayscale (B==G==R) the 3x3 covariance is rank-1 singular.
+        # Build a full-rank 3-channel feature image: [denoised intensity, local gradient energy, local std].
+        gray_u8 = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2GRAY)
+        ch0 = cv2.bilateralFilter(gray_u8, 5, 25, 25)
+        gray_f = gray_u8.astype(np.float32)
+        gx_m = cv2.Sobel(gray_f, cv2.CV_32F, 1, 0, ksize=3)
+        gy_m = cv2.Sobel(gray_f, cv2.CV_32F, 0, 1, ksize=3)
+        gmag_m = cv2.GaussianBlur(np.hypot(gx_m, gy_m), (5, 5), 0.0)
+        ch1 = np.clip(gmag_m * 2.2, 0.0, 255.0).astype(np.uint8)
+        m7 = cv2.boxFilter(gray_f, cv2.CV_32F, (7, 7))
+        s7 = np.sqrt(np.maximum(cv2.boxFilter(gray_f * gray_f, cv2.CV_32F, (7, 7)) - m7 * m7, 0.0))
+        ch2 = np.clip(s7 * 4.0, 0.0, 255.0).astype(np.uint8)
+        gc_img = np.stack([ch0, ch1, ch2], axis=2)
+    else:
+        gc_img = small_bgr
+
     gc_mask = np.full((sh, sw), cv2.GC_BGD, dtype=np.uint8)
     bgd_model = np.zeros((1, 65), dtype=np.float64)
     fgd_model = np.zeros((1, 65), dtype=np.float64)
@@ -286,19 +316,19 @@ def segment_frame(
             mx = max(1, rw // 5)
             my = max(1, rh // 5)
             gc_mask[ry + my : ry + rh - my, rx + mx : rx + rw - mx] = cv2.GC_PR_FGD
-        elif sharp_onboarding and pos_pts and neg_pts and rw >= 12 and rh >= 12:
+        elif sharp_onboarding and pos_pts and neg_pts and rw >= 12 and rh >= 12 and not is_mono_frame:
             # Suppress adjacent distractors inside the box ONLY when explicitly closer to a negative seed
             # than to any positive seed (preserves multi-colored printed labels like cans/cards/boxes)
-            small_lab = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-            chroma_std = float(np.std(small_lab[ry : ry + rh, rx : rx + rw, 1:3]))
-            is_color = chroma_std > 4.0
+            small_lab = small_lab_chk
 
             def _sample_seeds(pts_list: list[tuple[float, float]]) -> list[np.ndarray]:
                 out_s: list[np.ndarray] = []
                 for px, py in pts_list:
                     sx_i = int(np.clip(round((px - crop_x0) * sx), 0, sw - 1))
                     sy_i = int(np.clip(round((py - crop_y0) * sy), 0, sh - 1))
-                    patch = small_lab[max(0, sy_i - 2) : min(sh, sy_i + 3), max(0, sx_i - 2) : min(sw, sx_i + 3)]
+                    patch = small_lab[
+                        max(0, sy_i - 2) : min(sh, sy_i + 3), max(0, sx_i - 2) : min(sw, sx_i + 3)
+                    ]
                     if patch.size > 0:
                         out_s.append(patch.reshape(-1, 3).mean(axis=0))
                 return out_s
@@ -316,23 +346,18 @@ def segment_frame(
                 def _min_lab_dist(feats: list[np.ndarray]) -> np.ndarray:
                     md = np.full((rh, rw), 1e6, dtype=np.float32)
                     for sf in feats:
-                        if is_color:
-                            d = np.sqrt(
-                                0.30 * (roi_lab[:, :, 0] - sf[0]) ** 2
-                                + 1.8 * (roi_lab[:, :, 1] - sf[1]) ** 2
-                                + 1.8 * (roi_lab[:, :, 2] - sf[2]) ** 2
-                            )
-                        else:
-                            d = np.abs(roi_lab[:, :, 0] - sf[0])
+                        d = np.sqrt(
+                            0.30 * (roi_lab[:, :, 0] - sf[0]) ** 2
+                            + 1.8 * (roi_lab[:, :, 1] - sf[1]) ** 2
+                            + 1.8 * (roi_lab[:, :, 2] - sf[2]) ** 2
+                        )
                         md = np.minimum(md, d)
                     return md
 
                 d_pos = _min_lab_dist(pos_feats)
                 d_neg = _min_lab_dist(neg_feats)
                 # Pixel is a likely distractor only if it strongly matches a near negative seed AND mismatches positive seeds
-                thresh_pos = 48.0 if is_color else 42.0
-                thresh_neg = 26.0 if is_color else 22.0
-                distractor = (d_neg < thresh_neg) & (d_pos > thresh_pos) & (d_neg + 16.0 < d_pos)
+                distractor = (d_neg < 26.0) & (d_pos > 48.0) & (d_neg + 16.0 < d_pos)
                 if float(np.mean(distractor)) < 0.65:
                     sub_gc = gc_mask[ry : ry + rh, rx : rx + rw]
                     sub_gc[distractor] = cv2.GC_PR_BGD
@@ -375,7 +400,7 @@ def segment_frame(
     if has_fg_cue and has_bg_cue:
         try:
             cv2.setRNGSeed(17)
-            cv2.grabCut(small_bgr, gc_mask, None, bgd_model, fgd_model, effective_iters, cv2.GC_INIT_WITH_MASK)
+            cv2.grabCut(gc_img, gc_mask, None, bgd_model, fgd_model, effective_iters, cv2.GC_INIT_WITH_MASK)
             small_mask = np.where(
                 (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD), 255, 0
             ).astype(np.uint8)
@@ -387,41 +412,6 @@ def segment_frame(
         small_mask = np.where(
             (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD), 255, 0
         ).astype(np.uint8)
-
-    # On monochrome/grayscale images where GrabCut's 1D intensity GMM chops off dark/bright textured
-    # sub-parts of an explicitly boxed object (e.g., black keyboard keys), preserve connected textured
-    # pixels strictly inside the user's explicit box (away from negative seeds).
-    if sharp_onboarding and explicit_box is not None:
-        small_lab_chk = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-        box_area_s = max(rw * rh, 1)
-        fg_fill = float(np.count_nonzero(small_mask[ry : ry + rh, rx : rx + rw])) / float(box_area_s)
-        if float(np.std(small_lab_chk[ry : ry + rh, rx : rx + rw, 1:3])) <= 4.0 and 0.12 <= fg_fill < 0.55:
-            gray_s = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
-            gx_s = cv2.Sobel(gray_s, cv2.CV_32F, 1, 0, ksize=3)
-            gy_s = cv2.Sobel(gray_s, cv2.CV_32F, 0, 1, ksize=3)
-            gmag_s = np.hypot(gx_s, gy_s)
-            tex_u8 = (gmag_s > 18.0).astype(np.uint8) * 255
-            tex_u8 = cv2.dilate(tex_u8, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
-            box_only = np.zeros((sh, sw), dtype=np.uint8)
-            box_only[ry : ry + rh, rx : rx + rw] = 255
-            # Respect explicit negative seeds
-            for nx, ny in neg_pts:
-                cv2.circle(
-                    box_only,
-                    (int(round((nx - crop_x0) * sx)), int(round((ny - crop_y0) * sy))),
-                    max(neg_r + 2, 5),
-                    0,
-                    -1,
-                )
-            cand_u8 = cv2.bitwise_and(cv2.bitwise_or(small_mask, tex_u8), box_only)
-            n_cc, cc_lbl, _, _ = cv2.connectedComponentsWithStats(cand_u8, connectivity=8)
-            if n_cc > 1:
-                fg_lbls = set(int(v) for v in np.unique(cc_lbl[small_mask > 0]) if v > 0)
-                rescued = np.zeros_like(small_mask)
-                for lbl in fg_lbls:
-                    rescued[cc_lbl == lbl] = 255
-                if int(np.count_nonzero(rescued)) > int(np.count_nonzero(small_mask)):
-                    small_mask = rescued
 
     # Fallback if GrabCut collapsed on low-contrast or uniform surface
     if int(np.count_nonzero(small_mask)) < 16:
